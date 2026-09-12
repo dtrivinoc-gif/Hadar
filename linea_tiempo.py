@@ -1,0 +1,289 @@
+"""
+linea_tiempo.py — Lógica pura (sin PySide6) para la pestaña "Línea de
+Tiempo": construcción de series de hitos, pares inicio/fin para las
+conexiones entre puntos, histograma de densidad para el filtro global,
+el cruce entre anomalías detectadas (anomalias.py) y su fecha real, y
+el formateo de duraciones en lenguaje natural.
+
+Filosofía generalista: NADA de esto asume un dominio. Toda columna de
+fecha se descubre con detectar_columnas_fecha() (anomalias.py) y toda
+relación inicio/fin viene de:
+  1. pares por token (TOKENS_TEMPORALES_PARES) -- heurística de nombre
+     de columna, sirve igual para venta ("pedido"->"entrega") que para
+     mantenimiento preventivo ("inicio"->"fin") o cualquier otro dominio
+     con procesos de dos tiempos.
+  2. pares_temporales_personalizados definidos a mano por el usuario
+     para ese esquema (memoria.py), que siempre tienen prioridad porque
+     representan una relación que la persona confirmó explícitamente.
+Nunca se asume que existe una columna con un nombre en particular.
+"""
+from __future__ import annotations
+
+import unicodedata
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+from .anomalias import TOKENS_TEMPORALES_PARES
+
+
+# ----------------------------------------------------------------------
+# Descubrimiento de pares inicio/fin (para las conexiones entre puntos)
+# ----------------------------------------------------------------------
+
+@dataclass
+class ParTemporal:
+    col_inicio: str
+    col_fin: str
+    etiqueta: str
+    origen: str  # "automatico" | "manual"
+
+
+def _sin_acentos(texto: str) -> str:
+    texto = unicodedata.normalize("NFKD", str(texto).lower())
+    return "".join(c for c in texto if not unicodedata.combining(c))
+
+
+def sugerir_pares_temporales(columnas_fecha, pares_personalizados=None):
+    """Junta los pares manuales guardados en memoria.py (siempre primero,
+    porque el usuario ya los confirmó) con los pares automáticos por
+    token de TOKENS_TEMPORALES_PARES. No repite un mismo par dos veces
+    aunque coincida por ambas vías."""
+    pares: list[ParTemporal] = []
+    vistos = set()
+
+    for p in (pares_personalizados or []):
+        clave = (p["col_anterior"], p["col_posterior"])
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        pares.append(ParTemporal(
+            col_inicio=p["col_anterior"],
+            col_fin=p["col_posterior"],
+            etiqueta=p.get("etiqueta") or f"{p['col_anterior']} → {p['col_posterior']}",
+            origen="manual",
+        ))
+
+    columnas_norm = {c: _sin_acentos(c) for c in columnas_fecha}
+    for token_a, token_b, etiqueta in TOKENS_TEMPORALES_PARES:
+        col_a = next((c for c, n in columnas_norm.items() if token_a in n), None)
+        col_b = next((c for c, n in columnas_norm.items() if token_b in n), None)
+        if col_a and col_b and col_a != col_b:
+            clave = (col_a, col_b)
+            if clave in vistos:
+                continue
+            vistos.add(clave)
+            pares.append(ParTemporal(col_inicio=col_a, col_fin=col_b, etiqueta=etiqueta, origen="automatico"))
+
+    return pares
+
+
+# ----------------------------------------------------------------------
+# Modo Hito
+# ----------------------------------------------------------------------
+
+def construir_serie_hitos(df: pd.DataFrame, columna_fecha: str) -> pd.Series:
+    """Timestamps válidos de una columna de fecha para el Modo Hito,
+    conservando el índice original del DataFrame (para poder volver a
+    la fila exacta al hacer clic en un punto)."""
+    fechas = pd.to_datetime(df[columna_fecha], errors="coerce", format="mixed")
+    return fechas.dropna()
+
+
+def tiene_componente_horario(fechas: pd.Series) -> bool:
+    """True si la columna de fecha trae hora real (no todos los valores
+    caen justo en medianoche). Un archivo exportado solo con fecha
+    (sin hora) parsea todo a las 00:00:00 -- en ese caso un eje "hora
+    del día" mostraría todo pegado en cero y mentiría, así que hay que
+    detectarlo antes de usarlo, no asumirlo."""
+    if fechas.empty:
+        return False
+    return not (
+        (fechas.dt.hour == 0).all()
+        and (fechas.dt.minute == 0).all()
+        and (fechas.dt.second == 0).all()
+    )
+
+
+def minutos_desde_medianoche(fechas: pd.Series) -> pd.Series:
+    """Minutos transcurridos desde medianoche (0-1439.99) para cada
+    timestamp, preservando el índice original -- usado como eje Y del
+    Modo Hito cuando tiene_componente_horario() da True."""
+    return fechas.dt.hour * 60 + fechas.dt.minute + fechas.dt.second / 60
+
+
+def construir_series_hitos_multiples(df: pd.DataFrame, columnas) -> dict:
+    """Como construir_serie_hitos pero para varias columnas de fecha a la
+    vez -- para cuando un dataset tiene más de una fecha relevante (ej.
+    fecha_envio/fecha_entrega, fecha_ultima_mantencion/fecha_siguiente)
+    y se quieren ver todas juntas, cada una con su propio color. Devuelve
+    {columna: Serie de timestamps válidos}, salteando columnas vacías o
+    inexistentes -- ninguna columna es obligatoria."""
+    resultado = {}
+    for col in columnas:
+        if col not in df.columns:
+            continue
+        serie = construir_serie_hitos(df, col)
+        if not serie.empty:
+            resultado[col] = serie
+    return resultado
+
+
+# ----------------------------------------------------------------------
+# Pares inicio/fin por fila + incoherencias cronológicas
+# ----------------------------------------------------------------------
+
+def construir_intervalos(df: pd.DataFrame, par: ParTemporal) -> pd.DataFrame:
+    """DataFrame con inicio, fin, duración y marca de incoherencia (fin
+    anterior a inicio) para conectar cada fila con una línea. El índice se conserva
+    para poder ubicar la fila real de cada barra."""
+    inicio = pd.to_datetime(df[par.col_inicio], errors="coerce", format="mixed")
+    fin = pd.to_datetime(df[par.col_fin], errors="coerce", format="mixed")
+    validas = inicio.notna() & fin.notna()
+    resultado = pd.DataFrame({
+        "inicio": inicio[validas],
+        "fin": fin[validas],
+    }, index=df.index[validas])
+    resultado["duracion"] = resultado["fin"] - resultado["inicio"]
+    resultado["incoherente"] = resultado["duracion"] < pd.Timedelta(0)
+    return resultado
+
+
+# ----------------------------------------------------------------------
+# Histograma de densidad (para el panel superior + slider de rango)
+# ----------------------------------------------------------------------
+
+_ESCALAS_BIN = [
+    ("hora", pd.Timedelta(hours=1)),
+    ("dia", pd.Timedelta(days=1)),
+    ("semana", pd.Timedelta(weeks=1)),
+    ("mes", pd.Timedelta(days=30)),
+    ("trimestre", pd.Timedelta(days=91)),
+    ("anio", pd.Timedelta(days=365)),
+]
+
+
+def elegir_escala_bins(fechas: pd.Series, objetivo_bins: int = 60):
+    """Elige automáticamente el ancho de bin (hora/día/semana/mes/...)
+    que deja el histograma con un número de barras legible -- ni un muro
+    de barras de una hora en 3 años de datos, ni 2 barras gigantes en
+    una semana de datos. Es la parte "Tufte" de la especificación: el
+    ancho se decide por los datos, nunca queda fijo a mano."""
+    if fechas.empty:
+        return "dia", pd.Timedelta(days=1)
+    rango = fechas.max() - fechas.min()
+    if rango <= pd.Timedelta(0):
+        return "dia", pd.Timedelta(days=1)
+    for nombre, ancho in _ESCALAS_BIN:
+        if rango / ancho <= objetivo_bins:
+            return nombre, ancho
+    return _ESCALAS_BIN[-1]
+
+
+def construir_histograma(fechas: pd.Series, objetivo_bins: int = 60):
+    """Devuelve (bordes_bins, conteos) listos para dibujar como barras
+    de densidad. bordes_bins tiene un elemento más que conteos (son los
+    límites de cada barra, no sus centros)."""
+    if fechas.empty:
+        return np.array([]), np.array([])
+    _, ancho = elegir_escala_bins(fechas, objetivo_bins)
+    piso = "D" if ancho >= pd.Timedelta(days=1) else "h"
+    inicio = fechas.min().floor(piso)
+    fin = fechas.max() + ancho
+    bordes = pd.date_range(inicio, fin, freq=ancho)
+    if len(bordes) < 2:
+        bordes = pd.date_range(inicio, inicio + ancho * 2, freq=ancho)
+    conteos, _ = np.histogram(
+        fechas.to_numpy().astype("int64"), bins=bordes.to_numpy().astype("int64")
+    )
+    return bordes, conteos
+
+
+# ----------------------------------------------------------------------
+# Cruce de anomalías (anomalias.py) con la línea de tiempo
+# ----------------------------------------------------------------------
+
+def anomalias_con_fecha(anomalias: list[dict], df: pd.DataFrame, columna_fecha_referencia: str):
+    """Cruza cada anomalía detectada con la fecha real de la(s) fila(s)
+    donde ocurrió, usando la columna de fecha elegida como referencia
+    para la Línea de Tiempo. Una anomalía que afecta muchas filas (ej.
+    'quiebre_patron' agrupado) queda anclada en la fecha MEDIANA de sus
+    filas afectadas -- el marcador representa el centro real del
+    fenómeno, no el primer o último caso encontrado."""
+    if columna_fecha_referencia not in df.columns:
+        return []
+    fechas_df = pd.to_datetime(df[columna_fecha_referencia], errors="coerce", format="mixed")
+
+    resultado = []
+    for a in anomalias:
+        indices = a.get("indices_atipicos")
+        if not indices:
+            idx_unico = a.get("fila_indice")
+            indices = [idx_unico] if idx_unico is not None else []
+        indices_validos = [i for i in indices if i in fechas_df.index and pd.notna(fechas_df.loc[i])]
+        if not indices_validos:
+            continue
+        fecha_marcador = fechas_df.loc[indices_validos].median()
+        resultado.append({"fecha": fecha_marcador, "anomalia": a})
+    return resultado
+
+
+# ----------------------------------------------------------------------
+# Duraciones entre dos puntos conectados (automáticos o manuales)
+# ----------------------------------------------------------------------
+
+_UNIDADES_DURACION = [
+    ("año", "años", 365.25 * 86400),
+    ("mes", "meses", 30 * 86400),
+    ("día", "días", 86400),
+    ("hora", "horas", 3600),
+    ("minuto", "minutos", 60),
+]
+
+
+def formatear_duracion(delta: pd.Timedelta) -> str:
+    """Convierte un Timedelta a texto natural con como máximo 2 unidades
+    (ej. '1 año, 5 meses', '3 días, 5 horas', '45 minutos'). Nunca baja a
+    segundos -- a esa escala ya no aporta a una lectura de negocio. Una
+    duración negativa (el punto 'fin' quedó antes que el 'inicio') se
+    muestra en valor absoluto con una nota explícita, no como un número
+    negativo que el usuario tendría que interpretar."""
+    segundos = delta.total_seconds()
+    absolutos = abs(segundos)
+    partes = []
+    restante = absolutos
+    for singular, plural_form, tam in _UNIDADES_DURACION:
+        cantidad = int(restante // tam)
+        if cantidad > 0:
+            etiqueta = singular if cantidad == 1 else plural_form
+            partes.append(f"{cantidad} {etiqueta}")
+            restante -= cantidad * tam
+        if len(partes) == 2:
+            break
+    if not partes:
+        minutos = max(1, round(absolutos / 60))
+        partes = [f"{minutos} {'minuto' if minutos == 1 else 'minutos'}"]
+    texto = ", ".join(partes)
+    if segundos < 0:
+        texto += " (orden invertido)"
+    return texto
+
+
+def resumen_duraciones(duraciones) -> dict | None:
+    """Promedio, mínimo y máximo de una lista/Serie de Timedelta, ya
+    formateados como texto natural. None si no hay ninguna duración
+    válida. Las incoherentes (negativas) SÍ entran al cálculo -- son
+    parte real de los datos, no un error a esconder; el promedio las
+    refleja tal cual, y cada valor queda igual marcado si es negativo."""
+    validas = [d for d in duraciones if pd.notna(d)]
+    if not validas:
+        return None
+    promedio = sum(validas, pd.Timedelta(0)) / len(validas)
+    return {
+        "n": len(validas),
+        "promedio": formatear_duracion(promedio),
+        "minimo": formatear_duracion(min(validas)),
+        "maximo": formatear_duracion(max(validas)),
+        "n_incoherentes": sum(1 for d in validas if d.total_seconds() < 0),
+    }
