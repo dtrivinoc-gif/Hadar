@@ -17,7 +17,7 @@ def main():
     if pantalla.exec() != QDialog.DialogCode.Accepted:
         sys.exit(0)  # cerró la pantalla de inicio sin elegir nada
 
-    window = HadarApp()
+    window = HadarApp(modo=pantalla.modo)
     if pantalla.modo == "continuar" and pantalla.ruta_proyecto:
         window.abrir_proyecto_desde_ruta(pantalla.ruta_proyecto)
     window.show()

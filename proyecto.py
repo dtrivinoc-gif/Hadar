@@ -71,17 +71,16 @@ def ruta_carpeta_proyectos():
 
 
 def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
-                      filtro_columna, filtro_valores, notas_manuales, indicadores):
+                      filtro_columna, filtro_valores, notas_manuales, indicadores,
+                      ml_activado=False, linea_base_ml=None, fuentes_datos=None):
     """
-    tablas: dict {nombre_tabla: DataFrame}
-    relaciones_ontologia: list[RelacionSugerida] o None (None = nunca se
-        abrió "Ver esquema" en esta sesión; distinto de lista vacía, que
-        significa "se confirmó que no hay relaciones")
-    filtro_columna: nombre de columna filtrada en Datos, o None/"Sin filtro"
-    filtro_valores: lista de valores seleccionados en ese filtro
-    notas_manuales: dict {(row_label, col_name): texto} -- SOLO las que
-        escribió el usuario a mano (ver table_model.notas_manuales())
-    indicadores: list[Indicador] (de indicadores.py)
+    ... (ver parámetros existentes arriba)
+    fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server", ...}}
+        de dónde vino cada tabla, para poder "Actualizar desde la fuente"
+        más adelante sin volver a pedir todo desde cero. NUNCA incluye la
+        contraseña de SQL Server -- esa se pide de nuevo cada vez que se
+        actualiza (decisión del usuario, más seguro que guardarla en un
+        .hadarproy que es un .zip común, fácil de abrir con 7-Zip).
     """
     metadata = {
         "version": VERSION_FORMATO,
@@ -97,6 +96,9 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
             for (row_label, col_name), texto in (notas_manuales or {}).items()
         ],
         "indicadores": [ind.to_dict() for ind in (indicadores or [])],
+        "ml_activado": bool(ml_activado),
+        "linea_base_ml": linea_base_ml or {},
+        "fuentes_datos": fuentes_datos or {},
     }
 
     carpeta = os.path.dirname(ruta)
@@ -116,7 +118,8 @@ class ProyectoCargado:
     para que HadarApp los aplique a su propio estado."""
 
     def __init__(self, tablas, nombre_tabla_activa, relaciones_ontologia,
-                 filtro_columna, filtro_valores, notas_manuales, indicadores_dict):
+                 filtro_columna, filtro_valores, notas_manuales, indicadores_dict,
+                 ml_activado=False, linea_base_ml=None, fuentes_datos=None):
         self.tablas = tablas
         self.nombre_tabla_activa = nombre_tabla_activa
         self.relaciones_ontologia = relaciones_ontologia
@@ -124,6 +127,9 @@ class ProyectoCargado:
         self.filtro_valores = filtro_valores
         self.notas_manuales = notas_manuales
         self.indicadores_dict = indicadores_dict  # lista de dicts -- convertir con Indicador.from_dict
+        self.ml_activado = ml_activado
+        self.linea_base_ml = linea_base_ml or {}
+        self.fuentes_datos = fuentes_datos or {}
 
 
 def abrir_proyecto(ruta):
@@ -155,13 +161,16 @@ def abrir_proyecto(ruta):
             filtro_valores=metadata.get("filtro_valores", []),
             notas_manuales=notas_manuales,
             indicadores_dict=metadata.get("indicadores", []),
+            ml_activado=metadata.get("ml_activado", False),
+            linea_base_ml=metadata.get("linea_base_ml", {}),
+            fuentes_datos=metadata.get("fuentes_datos", {}),
         )
 
 
 def info_rapida_proyecto(ruta):
     """Nombre + cuántas tablas tiene un .hadarproy, sin cargar los datos
-    completos -- pensado para una futura pantalla de inicio con una lista
-    de proyectos recientes. Devuelve None si el archivo no es válido."""
+    completos -- pensado para la pantalla de inicio con la lista de
+    proyectos recientes. Devuelve None si el archivo no es válido."""
     try:
         with zipfile.ZipFile(ruta, "r") as z:
             metadata = json.loads(z.read("proyecto.json").decode("utf-8"))
@@ -170,6 +179,8 @@ def info_rapida_proyecto(ruta):
             "n_tablas": len(metadata.get("tablas", [])),
             "tabla_activa": metadata.get("nombre_tabla_activa"),
             "modificado": os.path.getmtime(ruta),
+            "peso_bytes": os.path.getsize(ruta),
+            "ml_activado": metadata.get("ml_activado", False),
         }
     except Exception:
         return None

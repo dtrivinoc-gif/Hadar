@@ -42,6 +42,8 @@ class QuestionAssistant:
                 preguntas.append(f"¿Por qué {cols} tiene tantos datos faltantes?")
             elif a["tipo"] == "duplicados":
                 preguntas.append("¿Por qué hay filas duplicadas en los datos?")
+            elif a["tipo"] == "deriva_historica":
+                preguntas.append(f"¿Qué cambió de fondo en {cols} respecto de lo que veníamos viendo?")
             else:
                 preguntas.append(f"¿Por qué no se está cumpliendo la regla sobre {cols}?")
 
@@ -98,6 +100,7 @@ _RECOMENDACIONES_BASE_POR_TIPO = {
     "regla_negocio": "Revisar los casos puntuales que no cumplen esta regla.",
     "temporal": "Revisar el proceso de captura de fechas en este paso.",
     "quiebre_patron": "Revisar qué ocurrió puntualmente en este registro.",
+    "deriva_historica": "Revisar si algo cambió de fondo en este dato (proceso, fuente, medición) desde la última vez.",
 }
 
 
@@ -962,6 +965,11 @@ class NarrativeGenerator:
             recomendaciones.append("Investigar qué ocurrió en los registros más recientes marcados como atípicos.")
         if "regla_negocio" in tipos_presentes:
             recomendaciones.append("Revisar los casos que no cumplen las reglas de negocio definidas.")
+        if "deriva_historica" in tipos_presentes:
+            recomendaciones.append(
+                "Este proyecto tiene aprendizaje continuo activado: algo se salió del comportamiento "
+                "histórico propio de estos datos, no solo de un umbral genérico."
+            )
         if not recomendaciones:
             recomendaciones.append("No se detectaron problemas relevantes con las reglas actuales.")
 

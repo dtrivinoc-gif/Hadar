@@ -334,6 +334,7 @@ class ChartPanel(QWidget):
         pw.getAxis("bottom").setTextPen(pg.mkPen(self.colors["text"]))
         pw.showGrid(x=False, y=True, alpha=0.15)
         pw.setMinimumHeight(300)
+        pw.setClipToView(True)
         self.plot_container.addWidget(pw)
         self.plot_widget = pw
 
@@ -361,6 +362,7 @@ class ChartPanel(QWidget):
                 pw.scene().sigMouseClicked.connect(
                     lambda ev, pw=pw: self._on_bar_clicked(ev, pw)
                 )
+                self._agregar_hover_categoria(pw, xvals, labels, values)
                 if self.chk_anotaciones.isChecked():
                     self._agregar_anotaciones_serie(pw, xvals, values)
 
@@ -379,10 +381,20 @@ class ChartPanel(QWidget):
 
                 self.categories = labels
                 self._bar_xvals = xvals
-                pw.plot(xvals, values, pen=pg.mkPen(COLOR_ACCENT, width=2),
-                        symbol="o", symbolBrush=COLOR_ACCENT, symbolSize=6)
+                # Con pocos puntos el símbolo ayuda a ubicar cada dato; con
+                # muchos, dibujar un círculo por punto es lo que traba la UI
+                # y además no se alcanza a ver (se pisan entre sí).
+                usar_simbolos = len(values) <= 500
+                curva = pw.plot(
+                    xvals, values, pen=pg.mkPen(COLOR_ACCENT, width=2),
+                    symbol="o" if usar_simbolos else None,
+                    symbolBrush=COLOR_ACCENT, symbolSize=6,
+                )
+                if not usar_simbolos:
+                    curva.setDownsampling(auto=True, method="peak")
                 if not usar_eje_fecha:
                     self._set_category_ticks(pw, labels)
+                self._agregar_hover_categoria(pw, xvals, labels, values)
                 if self.chk_anotaciones.isChecked():
                     self._agregar_anotaciones_serie(pw, xvals, values)
 
@@ -391,11 +403,19 @@ class ChartPanel(QWidget):
                     xs = pd.to_numeric(df[x_col], errors="coerce")
                     ys = pd.to_numeric(df[y_col], errors="coerce")
                     mask = xs.notna() & ys.notna()
-                    scatter = pg.ScatterPlotItem(
-                        x=xs[mask].tolist(), y=ys[mask].tolist(),
-                        brush=pg.mkBrush(COLOR_ACCENT + "B3"), pen=None, size=8
-                    )
-                    pw.addItem(scatter)
+                    n_puntos = int(mask.sum())
+                    # Con demasiados puntos, dibujarlos uno a uno solo produce
+                    # una mancha ilegible (y traba la UI). Mejor mostrar la
+                    # densidad: dónde se concentran los datos, que es la
+                    # pregunta real detrás de un scatter con este volumen.
+                    if n_puntos > 20_000:
+                        self._render_densidad(pw, xs[mask].to_numpy(), ys[mask].to_numpy())
+                    else:
+                        scatter = pg.ScatterPlotItem(
+                            x=xs[mask].tolist(), y=ys[mask].tolist(),
+                            brush=pg.mkBrush(COLOR_ACCENT + "B3"), pen=None, size=8
+                        )
+                        pw.addItem(scatter)
                     if self.chk_anotaciones.isChecked() and mask.any():
                         self._linea_referencia(
                             pw, float(ys[mask].mean()), angulo=0,
@@ -424,12 +444,23 @@ class ChartPanel(QWidget):
         except Exception as e:
             pw.addItem(pg.TextItem(f"Error: {e}", color=COLOR_DANGER))
 
-    def _set_category_ticks(self, pw, labels, max_ticks=15):
+    def _set_category_ticks(self, pw, labels, max_ticks=9):
+        """Menos etiquetas que categorías reales, a propósito: con muchas
+        barras no caben todos los nombres sin que se amontonen, y forzar el
+        texto no soluciona nada (Tufte: mejor pocas etiquetas legibles que
+        muchas ilegibles). El nombre exacto de cada barra se ve completo
+        al pasar el mouse por encima (ver _agregar_hover_categoria)."""
         n = len(labels)
         if n == 0:
             return
-        step = max(1, n // max_ticks)
-        ticks = [(i, str(lbl)[:14]) for i, lbl in enumerate(labels) if i % step == 0]
+        step = max(1, math.ceil(n / max_ticks))
+        largo_max = 12
+
+        def _acortar(txt):
+            txt = str(txt)
+            return txt if len(txt) <= largo_max else txt[:largo_max - 1] + "…"
+
+        ticks = [(i, _acortar(lbl)) for i, lbl in enumerate(labels) if i % step == 0]
         pw.getAxis("bottom").setTicks([ticks])
 
     @classmethod
@@ -488,6 +519,69 @@ class ChartPanel(QWidget):
             labelOpts={"color": self.colors["muted"], "position": 0.95, "movable": False},
         )
         pw.addItem(linea)
+
+    def _render_densidad(self, pw, xs, ys, bins=120):
+        """Histograma 2D en vez de puntos individuales: con cientos de miles
+        de filas la nube de puntos se satura y no se lee nada; la densidad sí
+        muestra dónde se concentran realmente los datos."""
+        hist, x_bordes, y_bordes = np.histogram2d(xs, ys, bins=bins)
+        img = pg.ImageItem(hist)
+        img.setRect(QRectF(x_bordes[0], y_bordes[0],
+                            x_bordes[-1] - x_bordes[0], y_bordes[-1] - y_bordes[0]))
+        colormap = pg.ColorMap(
+            [0.0, 0.5, 1.0],
+            [pg.mkColor(self.colors["card"]), pg.mkColor(COLOR_ACCENT), pg.mkColor("#f3f4f6")],
+        )
+        img.setLookupTable(colormap.getLookupTable(0.0, 1.0, 256))
+        pw.addItem(img)
+        nota = pg.TextItem(
+            f"{len(xs):,} puntos agrupados por densidad".replace(",", "."),
+            color=self.colors["muted"], anchor=(0, 0),
+        )
+        nota.setPos(x_bordes[0], y_bordes[-1])
+        pw.addItem(nota)
+
+    def _agregar_hover_categoria(self, pw, xvals, categories, values):
+        """Al mover el mouse sobre el gráfico, muestra el nombre completo de
+        la categoría y su valor exacto — así no hace falta que el eje X
+        muestre todas las etiquetas a la vez para saber qué es cada barra."""
+        if not xvals:
+            return
+
+        fondo = self.colors["card"] + "E6"  # semi-transparente
+        etiqueta = pg.TextItem(anchor=(0, 1), color=self.colors["text"], fill=fondo,
+                                border=pg.mkPen(self.colors["muted"], width=1))
+        etiqueta.hide()
+        pw.addItem(etiqueta, ignoreBounds=True)
+
+        linea = pg.InfiniteLine(angle=90, movable=False,
+                                 pen=pg.mkPen(self.colors["muted"], width=1, style=Qt.DashLine))
+        linea.hide()
+        pw.addItem(linea)
+
+        paso_medio = (max(xvals) - min(xvals) + 1) / max(len(xvals), 1) if len(xvals) > 1 else 1
+
+        def _mover(evento):
+            escena_pos = evento[0]
+            vb = pw.getPlotItem().getViewBox()
+            if not pw.sceneBoundingRect().contains(escena_pos):
+                etiqueta.hide()
+                linea.hide()
+                return
+            punto = vb.mapSceneToView(escena_pos)
+            idx = min(range(len(xvals)), key=lambda i: abs(xvals[i] - punto.x()))
+            if abs(xvals[idx] - punto.x()) > paso_medio:
+                etiqueta.hide()
+                linea.hide()
+                return
+            etiqueta.setText(f"{categories[idx]}\n{self._formato_num(values[idx])}")
+            etiqueta.setPos(xvals[idx], values[idx])
+            linea.setPos(xvals[idx])
+            etiqueta.show()
+            linea.show()
+
+        proxy = pg.SignalProxy(pw.scene().sigMouseMoved, rateLimit=30, slot=_mover)
+        pw._hover_proxy = proxy  # referencia viva para que no la borre el GC
 
     def _agregar_anotaciones_serie(self, pw, xvals, values):
         """Línea de referencia con el promedio de la serie, y —si no hay

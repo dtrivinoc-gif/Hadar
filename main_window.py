@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QFileDialog, QRadioButton, QButtonGroup,
     QHeaderView, QInputDialog, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QTabBar, QDialog, QApplication, QTextBrowser,
-    QDialogButtonBox, QToolButton, QMenu,
+    QDialogButtonBox, QToolButton, QMenu, QFormLayout,
 )
 from PySide6.QtPrintSupport import QPrinter
 
@@ -32,7 +32,10 @@ from .config import (
     THEMES, COLOR_ACCENT, COLOR_ACCENT_2, COLOR_ACCENT_3, COLOR_HOVER,
     COLOR_DANGER, ICON_PATH, LOGO_PNG_PATH,
 )
-from .io_datos import SqlMultipleTablesError, read_sql_file, load_data, _excel_sheet_names
+from .io_datos import (
+    SqlMultipleTablesError, read_sql_file, load_data, _excel_sheet_names,
+    SqlServerNoDisponible, listar_tablas_sql_server, leer_tabla_sql_server,
+)
 from .table_model import PandasTableModel
 from .graficos import UfWorker, ChartPanel, render_boxplot, build_stylesheet, create_stat_card, set_card_alarma
 from .indicadores import (
@@ -45,6 +48,7 @@ from .report_widgets import (
 )
 from .memoria import MemoriaHadar
 from .proyecto import guardar_proyecto, abrir_proyecto, ruta_carpeta_proyectos, EXTENSION
+from .aprendizaje_adaptativo import actualizar_linea_base
 from .anomalias import SemanticAnomalyDetector, anomalias_a_notas_celda, detectar_columnas_fecha
 from .dialogos_temporales import ConfigurarRelacionesTemporalesDialog
 from .narrativa import QuestionAssistant, NarrativeGenerator, _decodificar_identidad_anomalia
@@ -213,13 +217,96 @@ class _DialogoElegirTablasSql(QDialog):
         ]
 
 
+class _DialogoConexionSqlServer(QDialog):
+    """Pide los datos para conectarse a un SQL Server DE VERDAD -- local o
+    de otro PC en la red -- a diferencia de "Cargar Archivo → .sql", que
+    solo lee un archivo de texto con instrucciones SQL, sin conectarse a
+    ningún servidor. Por seguridad, la contraseña NUNCA se guarda en el
+    proyecto -- este mismo diálogo se reusa también para "Actualizar desde
+    la fuente", pidiéndola de nuevo cada vez."""
+
+    def __init__(self, parent=None, valores_iniciales=None):
+        super().__init__(parent)
+        self.setWindowTitle("Conectar a SQL Server")
+        self.resize(360, 260)
+        valores_iniciales = valores_iniciales or {}
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.txt_servidor = QLineEdit(valores_iniciales.get("servidor", ""))
+        self.txt_servidor.setPlaceholderText("ej. 192.168.1.15 o NOMBRE-PC")
+        form.addRow("Servidor:", self.txt_servidor)
+
+        self.txt_puerto = QLineEdit(str(valores_iniciales.get("puerto", 1433)))
+        form.addRow("Puerto:", self.txt_puerto)
+
+        self.txt_base_datos = QLineEdit(valores_iniciales.get("base_datos", ""))
+        form.addRow("Base de datos:", self.txt_base_datos)
+
+        self.txt_usuario = QLineEdit(valores_iniciales.get("usuario", ""))
+        form.addRow("Usuario:", self.txt_usuario)
+
+        self.txt_password = QLineEdit()
+        self.txt_password.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Contraseña:", self.txt_password)
+
+        layout.addLayout(form)
+
+        aviso = QLabel(
+            "La contraseña no se guarda -- se vuelve a pedir cada vez que "
+            "conectas o actualizas."
+        )
+        aviso.setWordWrap(True)
+        aviso.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(aviso)
+
+        botones = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        botones.accepted.connect(self.accept)
+        botones.rejected.connect(self.reject)
+        layout.addWidget(botones)
+
+    def valores(self):
+        try:
+            puerto = int(self.txt_puerto.text().strip())
+        except ValueError:
+            puerto = 1433
+        return {
+            "servidor": self.txt_servidor.text().strip(),
+            "puerto": puerto,
+            "base_datos": self.txt_base_datos.text().strip(),
+            "usuario": self.txt_usuario.text().strip(),
+            "password": self.txt_password.text(),
+        }
+
+
 class HadarApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, modo="nuevo"):
         super().__init__()
         self.setWindowTitle("Hadar Data Analytics Pro")
         self.resize(1300, 850)
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
+
+        # De dónde viene esta sesión: "nuevo" (proyecto pensado para
+        # guardarse y usarse seguido), "casual" (análisis rápido y
+        # desechable, nunca se guarda ni tiene ML) o "continuar" (ver
+        # abrir_proyecto_desde_ruta, que llega desde la Pantalla de Inicio).
+        self.modo_sesion = modo
+        # None = todavía no se decide si este proyecto tiene aprendizaje
+        # adaptativo. Se pregunta una sola vez, en el primer "Guardar
+        # Proyecto" (ver _guardar_proyecto), y de ahí en adelante queda
+        # fijo para este proyecto -- o se carga directo del archivo si el
+        # modo es "continuar" (ver abrir_proyecto_desde_ruta).
+        self.ml_activado = None
+        # Línea base adaptativa acumulada de este proyecto (ver
+        # aprendizaje_adaptativo.py) -- vacía hasta que se guarda o
+        # reabre un proyecto con ml_activado=True.
+        self.linea_base_ml = {}
+        # De dónde vino cada tabla ({nombre_tabla: {"tipo": "archivo"|"sql_server", ...}})
+        # -- para poder "Actualizar" sin volver a preguntar todo. Nunca
+        # incluye contraseñas (ver _DialogoConexionSqlServer).
+        self.fuentes_datos = {}
 
         self.theme_name = "dark"
         self.colors = THEMES[self.theme_name]
@@ -292,6 +379,12 @@ class HadarApp(QMainWindow):
         self._build_main_area(root_layout)
         self.apply_theme(self.theme_name)
 
+        if self.modo_sesion == "casual":
+            # Un "Análisis Casual" es desechable a propósito: sin botón de
+            # Guardar Proyecto no hay tentación de guardarlo a medias, y
+            # así nunca termina teniendo un archivo .hadarproy ni ML.
+            self.btn_guardar_proyecto.setVisible(False)
+
     # ------------------------------------------------------------------
     # SIDEBAR
     # ------------------------------------------------------------------
@@ -363,6 +456,26 @@ class HadarApp(QMainWindow):
         btn_load.clicked.connect(self.on_load_file)
         sidebar_layout.addWidget(btn_load)
 
+        fila_sql_server = QHBoxLayout()
+        btn_conectar_sql_server = QPushButton("Conectar a SQL Server...")
+        btn_conectar_sql_server.setToolTip(
+            "Se conecta EN VIVO a un SQL Server (local o de otro PC en la "
+            "red) -- distinto de cargar un archivo .sql suelto."
+        )
+        btn_conectar_sql_server.clicked.connect(self._conectar_sql_server)
+        fila_sql_server.addWidget(btn_conectar_sql_server)
+
+        self.btn_actualizar_fuente = QPushButton("↻ Actualizar")
+        self.btn_actualizar_fuente.setToolTip(
+            "Vuelve a traer los datos de donde vinieron (archivo o SQL "
+            "Server) para la tabla activa. Disponible solo si esa tabla "
+            "vino de un archivo o de una conexión en vivo."
+        )
+        self.btn_actualizar_fuente.clicked.connect(self._actualizar_desde_la_fuente)
+        self.btn_actualizar_fuente.setEnabled(False)
+        fila_sql_server.addWidget(self.btn_actualizar_fuente)
+        sidebar_layout.addLayout(fila_sql_server)
+
         # "Chip" con el archivo cargado: reemplaza el texto suelto por una
         # pequeña tarjeta, para que se lea como un dato de estado y no como
         # una nota perdida entre botones.
@@ -386,6 +499,7 @@ class HadarApp(QMainWindow):
         )
         btn_guardar_proyecto.clicked.connect(self._guardar_proyecto)
         fila_proyecto.addWidget(btn_guardar_proyecto)
+        self.btn_guardar_proyecto = btn_guardar_proyecto
 
         btn_abrir_proyecto = QPushButton("Abrir Proyecto")
         btn_abrir_proyecto.setToolTip("Continúa un análisis guardado antes con \"Guardar Proyecto\".")
@@ -873,10 +987,12 @@ class HadarApp(QMainWindow):
             return
 
         nuevas_tablas = {}      # {nombre_tabla: DataFrame}
+        nuevas_fuentes = {}     # {nombre_tabla: {"tipo": "archivo", "ruta": ...}}
         info_principal = None   # (path, hojas, hoja_elegida, motor) del 1er archivo cargado OK
         errores = []
 
         for path in paths:
+            ext = os.path.splitext(path)[1].lower()
             try:
                 tablas_del_archivo = self._leer_tablas_de_archivo(path)
             except SqlMultipleTablesError as e:
@@ -915,6 +1031,12 @@ class HadarApp(QMainWindow):
             for entrada in tablas_del_archivo:
                 nombre_tabla = self._nombre_tabla_disponible(entrada["nombre"], nuevas_tablas)
                 nuevas_tablas[nombre_tabla] = entrada["df"]
+                # Un .sql es un dump de texto ya congelado -- "actualizarlo"
+                # no tiene el mismo sentido que un Excel/CSV que alguien más
+                # puede seguir editando, así que no se ofrece el botón para
+                # esas tablas (sí para csv/xlsx/xls/parquet).
+                if ext != ".sql":
+                    nuevas_fuentes[nombre_tabla] = {"tipo": "archivo", "ruta": path}
                 if info_principal is None:
                     info_principal = (path, entrada["hojas_libro"], entrada["hoja"], entrada["motor"])
 
@@ -933,6 +1055,7 @@ class HadarApp(QMainWindow):
         # maquinaria que ya existía (hojas de Excel, motor, UF, etc.), sin
         # ningún cambio de comportamiento respecto de antes.
         self.tablas = nuevas_tablas
+        self.fuentes_datos = nuevas_fuentes
         self.nombre_tabla_activa = next(iter(nuevas_tablas))
         self.df = nuevas_tablas[self.nombre_tabla_activa]
         self.filtro_grafico = None
@@ -962,6 +1085,7 @@ class HadarApp(QMainWindow):
             self.apply_table_filter()
             self.lbl_placeholder.setVisible(False)
             self._actualizar_boton_esquema()
+            self._actualizar_boton_fuente()
         except Exception as e:
             # Antes, un error acá cortaba la función a medias en silencio:
             # "Ver diagrama"/el selector de tablas quedaban sin actualizar,
@@ -1601,6 +1725,155 @@ class HadarApp(QMainWindow):
         )
         self.refresh_all_column_lists()
         self.apply_table_filter()
+        self._actualizar_boton_fuente()
+
+    def _actualizar_boton_fuente(self):
+        """Habilita '↻ Actualizar' solo si la tabla activa vino de un
+        archivo o de una conexión SQL Server -- una tabla nueva sin
+        guardar todavía, o de un .sql (dump estático), no tiene fuente."""
+        info = self.fuentes_datos.get(self.nombre_tabla_activa)
+        self.btn_actualizar_fuente.setEnabled(info is not None)
+        if info is None:
+            self.btn_actualizar_fuente.setToolTip(
+                "Esta tabla no tiene una fuente para actualizar (no vino de "
+                "un archivo ni de una conexión SQL Server)."
+            )
+        elif info["tipo"] == "archivo":
+            self.btn_actualizar_fuente.setToolTip(f"Vuelve a leer: {info['ruta']}")
+        else:
+            self.btn_actualizar_fuente.setToolTip(
+                f"Se vuelve a conectar a {info['servidor']} y trae la tabla "
+                f"'{info['tabla']}' de nuevo (pide la contraseña otra vez)."
+            )
+
+    def _conectar_sql_server(self):
+        """Conexión EN VIVO a un SQL Server -- distinto de 'Cargar Archivo
+        → .sql', que solo lee un dump de texto sin conectarse a nada."""
+        dialogo = _DialogoConexionSqlServer(self)
+        if dialogo.exec() != QDialog.DialogCode.Accepted:
+            return
+        datos_conexion = dialogo.valores()
+        if not datos_conexion["servidor"] or not datos_conexion["base_datos"]:
+            QMessageBox.warning(self, "Faltan datos", "Servidor y base de datos son obligatorios.")
+            return
+
+        try:
+            tablas_disponibles = listar_tablas_sql_server(
+                datos_conexion["servidor"], datos_conexion["puerto"],
+                datos_conexion["base_datos"], datos_conexion["usuario"],
+                datos_conexion["password"],
+            )
+        except SqlServerNoDisponible as e:
+            QMessageBox.critical(self, "No se pudo conectar", str(e))
+            return
+
+        if not tablas_disponibles:
+            QMessageBox.information(self, "Sin tablas", "Esa base de datos no tiene tablas.")
+            return
+
+        selector = _DialogoElegirTablasSql(tablas_disponibles, datos_conexion["base_datos"], self)
+        if selector.exec() != QDialog.DialogCode.Accepted:
+            return
+        elegidas = selector.tablas_elegidas()
+
+        nuevas_tablas = {}
+        nuevas_fuentes = {}
+        errores = []
+        for nombre_tabla_sql in elegidas:
+            try:
+                df = leer_tabla_sql_server(
+                    datos_conexion["servidor"], datos_conexion["puerto"],
+                    datos_conexion["base_datos"], datos_conexion["usuario"],
+                    datos_conexion["password"], nombre_tabla_sql,
+                )
+            except SqlServerNoDisponible as e:
+                errores.append(str(e))
+                continue
+            nombre_tabla = self._nombre_tabla_disponible(nombre_tabla_sql, nuevas_tablas)
+            nuevas_tablas[nombre_tabla] = df
+            # Se guarda todo menos la contraseña -- ver _DialogoConexionSqlServer.
+            nuevas_fuentes[nombre_tabla] = {
+                "tipo": "sql_server", "servidor": datos_conexion["servidor"],
+                "puerto": datos_conexion["puerto"], "base_datos": datos_conexion["base_datos"],
+                "usuario": datos_conexion["usuario"], "tabla": nombre_tabla_sql,
+            }
+
+        if not nuevas_tablas:
+            QMessageBox.critical(self, "No se pudo traer ninguna tabla", "\n".join(errores))
+            return
+        if errores:
+            QMessageBox.warning(self, "Algunas tablas no se pudieron traer", "\n".join(errores))
+
+        self.tablas = nuevas_tablas
+        self.fuentes_datos = nuevas_fuentes
+        self.nombre_tabla_activa = next(iter(nuevas_tablas))
+        self.df = nuevas_tablas[self.nombre_tabla_activa]
+        self.filtro_grafico = None
+        self.table_model.limpiar_todas_las_notas()
+        self._quitar_marcas_limpieza()
+        self.excel_path = None
+        self.excel_sheet_names = []
+        self.excel_hojas_activas = []
+        self._actualizar_panel_hojas_excel()
+
+        sufijo_multi_tabla = (
+            f"  (+{len(nuevas_tablas) - 1} tabla{'s' if len(nuevas_tablas) > 2 else ''} más)"
+            if len(nuevas_tablas) > 1 else ""
+        )
+        self.lbl_archivo.setText(
+            f"SQL Server: {datos_conexion['base_datos']}{sufijo_multi_tabla}\n"
+            f"{self.df.shape[0]:,} filas, {self.df.shape[1]} col."
+        )
+        self.refresh_all_column_lists()
+        self.apply_table_filter()
+        self.lbl_placeholder.setVisible(False)
+        self._actualizar_boton_esquema()
+        self._actualizar_boton_fuente()
+
+    def _actualizar_desde_la_fuente(self):
+        """Vuelve a traer los datos de la tabla ACTIVA desde donde vinieron
+        -- un archivo (Excel/CSV/Parquet compartido que alguien más pudo
+        haber editado) o una conexión SQL Server en vivo."""
+        info = self.fuentes_datos.get(self.nombre_tabla_activa)
+        if info is None:
+            return
+
+        if info["tipo"] == "archivo":
+            try:
+                df_nuevo, _motor = load_data(info["ruta"])
+            except Exception as e:
+                QMessageBox.critical(self, "No se pudo actualizar", str(e))
+                return
+        else:
+            password, ok = QInputDialog.getText(
+                self, "Contraseña de SQL Server",
+                f"Usuario: {info['usuario']} @ {info['servidor']}\nContraseña:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                return
+            try:
+                df_nuevo = leer_tabla_sql_server(
+                    info["servidor"], info["puerto"], info["base_datos"],
+                    info["usuario"], password, info["tabla"],
+                )
+            except SqlServerNoDisponible as e:
+                QMessageBox.critical(self, "No se pudo actualizar", str(e))
+                return
+
+        self.tablas[self.nombre_tabla_activa] = df_nuevo
+        self.df = df_nuevo
+        self.filtro_grafico = None
+        self.refresh_all_column_lists()
+        self.apply_table_filter()
+        self.lbl_archivo.setText(
+            f"{self.nombre_tabla_activa}  (actualizado)\n"
+            f"{self.df.shape[0]:,} filas, {self.df.shape[1]} col."
+        )
+        QMessageBox.information(
+            self, "Actualizado",
+            f"'{self.nombre_tabla_activa}' se actualizó: {self.df.shape[0]:,} filas."
+        )
 
     def _abrir_ventana_esquema(self):
         if len(self.tablas) < 2:
@@ -1639,6 +1912,26 @@ class HadarApp(QMainWindow):
         filtro_columna = self.datos_filter_col.currentText()
         filtro_valores = [item.text() for item in self.datos_values_list.selectedItems()]
 
+        if self.ml_activado is None:
+            # Se pregunta una sola vez por proyecto -- de ahí en adelante
+            # queda fijo, no se vuelve a preguntar en guardados siguientes.
+            respuesta = QMessageBox.question(
+                self, "Aprendizaje continuo",
+                "¿Quieres activar el aprendizaje continuo para este proyecto?\n\n"
+                "Con cada guardado, Hadar va aprendiendo el rango normal de "
+                "TUS propios datos en vez de usar un umbral genérico -- pero "
+                "solo tiene sentido si vas a seguir actualizando este mismo "
+                "proyecto en el tiempo, no para análisis puntuales.",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            self.ml_activado = (respuesta == QMessageBox.Yes)
+
+        if self.ml_activado:
+            # Foto de los datos ACTUALES, justo antes de guardar -- así
+            # la línea base queda al día con lo que se está guardando,
+            # no con lo que había la última vez que se abrió el proyecto.
+            self.linea_base_ml = actualizar_linea_base(self.linea_base_ml, self.tablas)
+
         try:
             guardar_proyecto(
                 path,
@@ -1649,6 +1942,9 @@ class HadarApp(QMainWindow):
                 filtro_valores=filtro_valores,
                 notas_manuales=self.table_model.notas_manuales(),
                 indicadores=self.indicadores,
+                ml_activado=self.ml_activado,
+                linea_base_ml=self.linea_base_ml,
+                fuentes_datos=self.fuentes_datos,
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar el proyecto", str(e))
@@ -1687,6 +1983,14 @@ class HadarApp(QMainWindow):
         self.df = self.tablas[self.nombre_tabla_activa]
         self.filtro_grafico = None
         self.relaciones_ontologia = datos_proyecto.relaciones_ontologia
+        self.ml_activado = datos_proyecto.ml_activado
+        self.linea_base_ml = datos_proyecto.linea_base_ml
+        self.fuentes_datos = datos_proyecto.fuentes_datos
+        if self.ml_activado:
+            # Foto de los datos tal como llegan al abrir -- útil sobre
+            # todo cuando el proyecto se actualizó afuera (ej. una BD que
+            # cambió) entre una sesión y la siguiente.
+            self.linea_base_ml = actualizar_linea_base(self.linea_base_ml, self.tablas)
 
         # No hay un archivo Excel real detrás de un proyecto reabierto,
         # así que el panel de "Hoja de Excel" no aplica acá.
@@ -1733,6 +2037,7 @@ class HadarApp(QMainWindow):
         self._actualizar_indicadores()
         self.lbl_placeholder.setVisible(False)
         self._actualizar_boton_esquema()
+        self._actualizar_boton_fuente()
 
         self._ultimo_guardado_firma = self._firma_estado_actual()
         QMessageBox.information(self, "Proyecto abierto", f"Continuando: {nombre_proyecto}")
@@ -2400,7 +2705,9 @@ class HadarApp(QMainWindow):
             pares_temporales_personalizados = self.memoria.obtener_pares_temporales(self.fingerprint_actual)
 
         detector = SemanticAnomalyDetector(
-            df, pares_temporales_personalizados=pares_temporales_personalizados
+            df, pares_temporales_personalizados=pares_temporales_personalizados,
+            linea_base_ml=self.linea_base_ml if self.ml_activado else None,
+            nombre_tabla=self.nombre_tabla_activa,
         )
         anomalias = detector.detect_all()
 
@@ -2458,7 +2765,11 @@ class HadarApp(QMainWindow):
         for nombre_t, df_t in self.tablas.items():
             if nombre_t == self.nombre_tabla_activa:
                 continue
-            detector_t = SemanticAnomalyDetector(df_t)
+            detector_t = SemanticAnomalyDetector(
+                df_t,
+                linea_base_ml=self.linea_base_ml if self.ml_activado else None,
+                nombre_tabla=nombre_t,
+            )
             tablas_relacionadas[nombre_t] = {"df": df_t, "anomalias": detector_t.detect_all()}
 
         relaciones = (

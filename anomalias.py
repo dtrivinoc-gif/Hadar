@@ -7,6 +7,8 @@ las anomalías detectadas en notas por celda sobre la tabla de datos.
 import numpy as np
 import pandas as pd
 
+from .aprendizaje_adaptativo import es_anomalo_segun_linea_base
+
 PROPORCION_MINIMA_FECHA_NARRATIVA = 0.8   # % de valores parseables como fecha
 TAMANO_MUESTRA_DETECCION_FECHA = 3000     # ver detectar_columnas_fecha
                                             # para considerar una columna "de fecha"
@@ -108,7 +110,8 @@ class SemanticAnomalyDetector:
 
     def __init__(self, df, umbral_z=3.0, minimo_muestras=10,
                  max_anomalias_individuales=5, reglas_negocio=None,
-                 pares_temporales_personalizados=None, umbral_minimo_nulos=0.01):
+                 pares_temporales_personalizados=None, umbral_minimo_nulos=0.01,
+                 linea_base_ml=None, nombre_tabla=None):
         self.df = df
         self.umbral_z = umbral_z
         # Con menos muestras que esto, la desviación estándar no es confiable
@@ -129,6 +132,15 @@ class SemanticAnomalyDetector:
         # Por debajo de este % de nulos en una columna no se reporta nada:
         # uno o dos valores faltantes sueltos son normales, no una anomalía.
         self.umbral_minimo_nulos = umbral_minimo_nulos
+        # Línea base adaptativa del PROYECTO (ver aprendizaje_adaptativo.py):
+        # solo tiene contenido si el proyecto activó el aprendizaje continuo.
+        # None/vacío = este chequeo simplemente no corre (comportamiento
+        # idéntico a antes de que existiera esta función).
+        self.linea_base_ml = linea_base_ml or {}
+        # Nombre de la tabla que representa este `df` dentro de
+        # linea_base_ml -- sin esto no hay forma de saber a qué entrada de
+        # la línea base corresponde cada columna.
+        self.nombre_tabla = nombre_tabla
 
     def detect_all(self):
         anomalias = []
@@ -137,6 +149,7 @@ class SemanticAnomalyDetector:
         anomalias += self._check_pattern_breaks()
         anomalias += self._check_valores_nulos()
         anomalias += self._check_duplicados()
+        anomalias += self._check_linea_base_ml()
         return anomalias
 
     def _check_valores_nulos(self):
@@ -360,6 +373,51 @@ class SemanticAnomalyDetector:
                         atipicos.abs().max(), self.umbral_z
                     ),
                 })
+        return anomalias
+
+    def _check_linea_base_ml(self):
+        """A diferencia de _check_pattern_breaks (que busca una FILA rara
+        dentro de la foto actual), este chequeo compara el promedio de la
+        foto ACTUAL contra lo que este mismo proyecto venía mostrando en
+        fotos anteriores -- solo corre si el proyecto tiene el aprendizaje
+        adaptativo activado (linea_base_ml y nombre_tabla presentes)."""
+        anomalias = []
+        if not self.linea_base_ml or not self.nombre_tabla:
+            return anomalias
+
+        estado_tabla = self.linea_base_ml.get(self.nombre_tabla, {})
+        if not estado_tabla:
+            return anomalias
+
+        num_cols = self.df.select_dtypes(include=[np.number]).columns
+        for col in num_cols:
+            estado = estado_tabla.get(str(col))
+            if not estado:
+                continue
+            valor_actual = pd.to_numeric(self.df[col], errors="coerce").mean(skipna=True)
+            if pd.isna(valor_actual):
+                continue
+            valor_actual = float(valor_actual)
+
+            if not es_anomalo_segun_linea_base(self.linea_base_ml, self.nombre_tabla, col, valor_actual):
+                continue
+
+            z_historico = abs(valor_actual - estado["media"]) / estado["desviacion"]
+            anomalias.append({
+                "tipo": "deriva_historica",
+                "columnas": [col],
+                "descripcion": (
+                    f"'{col}' promedia {valor_actual:,.2f} en los datos actuales -- muy "
+                    f"distinto de los {estado['media']:,.2f} que este proyecto venía "
+                    f"mostrando en sus últimas {estado['n']} actualizaciones."
+                ),
+                "filas_afectadas": len(self.df),
+                "porcentaje": 100.0,
+                "indices_atipicos": [],
+                "gravedad": "alta" if z_historico > 4.5 else "media",
+                "valor_tipico": estado["media"],
+                "severidad_impacto": _clasificar_severidad_impacto(z_historico, 3.0),
+            })
         return anomalias
 
 

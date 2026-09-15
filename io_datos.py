@@ -19,6 +19,11 @@ try:
 except ImportError:
     requests = None
 
+try:
+    import pymssql
+except ImportError:
+    pymssql = None
+
 from .config import FILAS_UMBRAL_MASIVO, TAMANO_UMBRAL_MASIVO_BYTES
 
 
@@ -188,6 +193,64 @@ def load_data(file_path: str):
         return pd.read_excel(file_path), "pandas"
 
 
+class SqlServerNoDisponible(Exception):
+    """Se lanza si falta pymssql instalado, o si la conexión/consulta falló
+    (servidor apagado, credenciales malas, firewall, etc.) -- siempre con
+    un mensaje en español, listo para mostrarlo tal cual en un QMessageBox."""
+    pass
+
+
+def _conectar_sql_server(servidor, puerto, base_datos, usuario, password):
+    if pymssql is None:
+        raise SqlServerNoDisponible(
+            "Falta instalar la librería 'pymssql' para conectarse a SQL Server "
+            "(ejecuta: pip install pymssql)."
+        )
+    try:
+        return pymssql.connect(
+            server=servidor, port=str(puerto), database=base_datos,
+            user=usuario, password=password, timeout=8, login_timeout=8,
+        )
+    except Exception as e:
+        raise SqlServerNoDisponible(
+            f"No se pudo conectar a {servidor}:{puerto} ({base_datos}). "
+            f"Revisa que el servidor esté encendido, acepte conexiones remotas, "
+            f"y que el usuario/contraseña sean correctos.\n\nDetalle: {e}"
+        ) from e
+
+
+def listar_tablas_sql_server(servidor, puerto, base_datos, usuario, password):
+    """Nombres de todas las tablas de esa base de datos -- para dejar
+    elegir cuál(es) cargar, igual que ya se hace con un archivo .sql."""
+    conn = _conectar_sql_server(servidor, puerto, base_datos, usuario, password)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME"
+        )
+        return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        raise SqlServerNoDisponible(f"No se pudo leer la lista de tablas: {e}") from e
+    finally:
+        conn.close()
+
+
+def leer_tabla_sql_server(servidor, puerto, base_datos, usuario, password, tabla):
+    """Trae una tabla completa de un SQL Server en vivo (local o de otro
+    PC en la red) como DataFrame -- a diferencia de read_sql_file(), esto
+    SÍ es una conexión real a un servidor, no un archivo .sql leído en una
+    base temporal. Los nombres de tabla se arman con corchetes para que
+    funcionen aunque tengan espacios o guiones."""
+    conn = _conectar_sql_server(servidor, puerto, base_datos, usuario, password)
+    try:
+        return pd.read_sql_query(f"SELECT * FROM [{tabla}]", conn)
+    except Exception as e:
+        raise SqlServerNoDisponible(f"No se pudo leer la tabla '{tabla}': {e}") from e
+    finally:
+        conn.close()
+
+
 def fetch_uf_online():
     if requests is None:
         return None
@@ -218,4 +281,3 @@ def cast_valor_a_dtype(valor_str: str, dtype):
     except (ValueError, TypeError):
         pass
     return valor_str
-

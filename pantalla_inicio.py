@@ -3,6 +3,10 @@ Pantalla de inicio de Hadar: lo primero que se ve al abrir la app, antes
 de la ventana grande de siempre -- igual que Word o Excel preguntan si
 quieres un documento nuevo o seguir uno reciente.
 
+Una sola pantalla con dos botones ("Nuevo Proyecto" / "Análisis Casual")
+y, debajo, la lista de proyectos recientes siempre visible (con su peso
+en disco y si tienen el aprendizaje adaptativo activado).
+
 Uso típico, desde main.py:
 
     app = QApplication(sys.argv)
@@ -20,6 +24,11 @@ Esta pantalla no sabe nada de pandas, tablas ni de cómo se abre un
 proyecto -- solo pregunta y devuelve una decisión (`self.modo` y
 `self.ruta_proyecto`). Quien la usa (main.py) es quien de verdad abre el
 proyecto con HadarApp.abrir_proyecto_desde_ruta().
+
+self.modo puede ser:
+    "nuevo"     -- proyecto nuevo, pensado para guardarse y usarse seguido
+    "casual"    -- análisis rápido y desechable, nunca se guarda ni tiene ML
+    "continuar" -- retomar un .hadarproy existente (self.ruta_proyecto)
 """
 import os
 from datetime import datetime
@@ -28,7 +37,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
-    QStackedWidget, QScrollArea, QWidget, QFileDialog, QSizePolicy,
+    QScrollArea, QWidget, QFileDialog, QSizePolicy,
 )
 
 from .config import THEMES, COLOR_ACCENT, LOGO_PNG_PATH
@@ -50,6 +59,16 @@ def _fecha_amigable(timestamp):
         semanas = dias // 7
         return f"hace {semanas} semana{'s' if semanas > 1 else ''}"
     return fecha.strftime("%d-%m-%Y")
+
+
+def _formato_tamano(num_bytes):
+    """'300 KB', '7.4 MB', etc. -- sin librerías extra."""
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    kb = num_bytes / 1024
+    if kb < 1024:
+        return f"{kb:.0f} KB"
+    return f"{kb / 1024:.1f} MB"
 
 
 class _TarjetaProyecto(QFrame):
@@ -89,6 +108,18 @@ class _TarjetaProyecto(QFrame):
         columna_texto.addWidget(lbl_detalle)
         layout.addLayout(columna_texto, stretch=1)
 
+        lbl_peso = QLabel(_formato_tamano(info.get("peso_bytes", 0)))
+        lbl_peso.setStyleSheet(f"color: {colors['muted']}; font-size: 11px;")
+        lbl_peso.setMinimumWidth(60)
+        layout.addWidget(lbl_peso)
+
+        ml_activo = bool(info.get("ml_activado"))
+        lbl_ml = QLabel("ML: Sí" if ml_activo else "ML: No")
+        color_ml = COLOR_ACCENT if ml_activo else colors["muted"]
+        lbl_ml.setStyleSheet(f"color: {color_ml}; font-size: 11px; font-weight: bold;")
+        lbl_ml.setMinimumWidth(48)
+        layout.addWidget(lbl_ml)
+
         lbl_fecha = QLabel(_fecha_amigable(info["modificado"]))
         lbl_fecha.setStyleSheet(f"color: {colors['muted']}; font-size: 11px;")
         layout.addWidget(lbl_fecha)
@@ -101,11 +132,16 @@ class _TarjetaProyecto(QFrame):
 
 
 class PantallaInicio(QDialog):
-    """Ventana de bienvenida: Nuevo análisis / Continuar un análisis.
+    """Ventana de bienvenida: Nuevo Proyecto / Análisis Casual, con la
+    lista de proyectos recientes siempre visible debajo (ya no en una
+    página aparte -- se ve todo de una, como en el boceto del usuario).
 
     Al cerrar con éxito (self.exec() == Accepted), revisa:
-        self.modo           -- "nuevo" o "continuar"
+        self.modo           -- "nuevo", "casual" o "continuar"
         self.ruta_proyecto  -- ruta del .hadarproy elegido (solo si modo == "continuar")
+
+    "Análisis Casual" es a propósito desechable: nunca llega a guardarse
+    como proyecto, por eso nunca tiene ML ni aparece en esta lista.
     """
 
     def __init__(self, parent=None):
@@ -115,7 +151,7 @@ class PantallaInicio(QDialog):
         self.colors = THEMES["dark"]
 
         self.setWindowTitle("Hadar Data Analytics")
-        self.setMinimumSize(560, 420)
+        self.setMinimumSize(560, 560)
         self.setStyleSheet(
             f"QDialog {{ background-color: {self.colors['bg']}; }}"
             f"QLabel {{ color: {self.colors['text']}; }}"
@@ -125,7 +161,7 @@ class PantallaInicio(QDialog):
         layout_general.setContentsMargins(30, 30, 30, 30)
         layout_general.setSpacing(16)
 
-        # --- encabezado (logo + título), presente en ambas páginas -------
+        # --- encabezado (logo + título) ------------------------------
         encabezado = QHBoxLayout()
         if os.path.exists(LOGO_PNG_PATH):
             lbl_logo = QLabel()
@@ -142,49 +178,54 @@ class PantallaInicio(QDialog):
         encabezado.addStretch()
         layout_general.addLayout(encabezado)
 
-        self.paginas = QStackedWidget()
-        layout_general.addWidget(self.paginas, stretch=1)
-
-        self.paginas.addWidget(self._construir_pagina_elegir())
-        self.paginas.addWidget(self._construir_pagina_lista())
-        self.paginas.setCurrentIndex(0)
-
-    # ------------------------------------------------------------------
-    # Página 1: los dos botones grandes
-    # ------------------------------------------------------------------
-    def _construir_pagina_elegir(self):
-        pagina = QWidget()
-        layout = QVBoxLayout(pagina)
-        layout.setSpacing(14)
-
-        subtitulo = QLabel("¿Qué quieres hacer?")
-        subtitulo.setStyleSheet(f"color: {self.colors['muted']}; font-size: 13px;")
-        layout.addWidget(subtitulo)
-
+        # --- los dos botones de entrada -------------------------------
         fila_botones = QHBoxLayout()
         fila_botones.setSpacing(16)
-
         fila_botones.addWidget(self._boton_grande(
-            "Nuevo análisis", "Carga datos desde cero.",
+            "Nuevo Proyecto", "Para un análisis que vas a seguir usando.",
             self._elegir_nuevo,
         ))
         fila_botones.addWidget(self._boton_grande(
-            "Continuar un análisis", "Retoma un proyecto que guardaste antes.",
-            self._ir_a_lista,
+            "Análisis Casual", "Revisión rápida y puntual. No se guarda.",
+            self._elegir_casual,
         ))
-        layout.addLayout(fila_botones)
-        layout.addStretch()
-        return pagina
+        layout_general.addLayout(fila_botones)
+
+        # --- lista de proyectos recientes, siempre visible -------------
+        lbl_lista_titulo = QLabel("Tus proyectos recientes")
+        fuente = QFont()
+        fuente.setBold(True)
+        fuente.setPointSize(12)
+        lbl_lista_titulo.setFont(fuente)
+        layout_general.addWidget(lbl_lista_titulo)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(f"QScrollArea {{ background-color: {self.colors['bg']}; border: none; }}")
+        self._contenedor_lista = QWidget()
+        self._contenedor_lista.setStyleSheet(f"background-color: {self.colors['bg']};")
+        self._layout_lista = QVBoxLayout(self._contenedor_lista)
+        self._layout_lista.setSpacing(6)
+        self._layout_lista.addStretch()
+        scroll.setWidget(self._contenedor_lista)
+        layout_general.addWidget(scroll, stretch=1)
+
+        btn_buscar = QPushButton("Buscar otro proyecto...")
+        btn_buscar.clicked.connect(self._buscar_otro_proyecto)
+        layout_general.addWidget(btn_buscar)
+
+        self._refrescar_lista()
 
     def _boton_grande(self, titulo, subtitulo, on_click):
         boton = QPushButton()
         boton.setCursor(Qt.CursorShape.PointingHandCursor)
-        boton.setMinimumHeight(140)
-        boton.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        boton.setMinimumHeight(90)
+        boton.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         boton.setStyleSheet(
             f"QPushButton {{ background-color: {self.colors['card']}; "
             f"border: 1px solid {self.colors['border']}; border-radius: 10px; text-align: left; "
-            f"padding: 16px; }}"
+            f"padding: 14px; }}"
             f"QPushButton:hover {{ border: 1px solid {COLOR_ACCENT}; }}"
         )
         contenido = QVBoxLayout(boton)
@@ -207,56 +248,12 @@ class PantallaInicio(QDialog):
         self.modo = "nuevo"
         self.accept()
 
-    # ------------------------------------------------------------------
-    # Página 2: lista de proyectos recientes
-    # ------------------------------------------------------------------
-    def _construir_pagina_lista(self):
-        pagina = QWidget()
-        layout = QVBoxLayout(pagina)
-        layout.setSpacing(10)
-
-        fila_titulo = QHBoxLayout()
-        btn_volver = QPushButton("< Volver")
-        btn_volver.setFlat(True)
-        btn_volver.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_volver.setStyleSheet(f"color: {self.colors['text']}; text-align: left;")
-        btn_volver.clicked.connect(lambda: self.paginas.setCurrentIndex(0))
-        fila_titulo.addWidget(btn_volver)
-        fila_titulo.addStretch()
-        layout.addLayout(fila_titulo)
-
-        lbl_lista_titulo = QLabel("Tus proyectos recientes")
-        fuente = QFont()
-        fuente.setBold(True)
-        fuente.setPointSize(12)
-        lbl_lista_titulo.setFont(fuente)
-        layout.addWidget(lbl_lista_titulo)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet(f"QScrollArea {{ background-color: {self.colors['bg']}; border: none; }}")
-        self._contenedor_lista = QWidget()
-        self._contenedor_lista.setStyleSheet(f"background-color: {self.colors['bg']};")
-        self._layout_lista = QVBoxLayout(self._contenedor_lista)
-        self._layout_lista.setSpacing(6)
-        self._layout_lista.addStretch()
-        scroll.setWidget(self._contenedor_lista)
-        layout.addWidget(scroll, stretch=1)
-
-        btn_buscar = QPushButton("Buscar otro proyecto...")
-        btn_buscar.clicked.connect(self._buscar_otro_proyecto)
-        layout.addWidget(btn_buscar)
-
-        return pagina
-
-    def _ir_a_lista(self):
-        self._refrescar_lista()
-        self.paginas.setCurrentIndex(1)
+    def _elegir_casual(self):
+        self.modo = "casual"
+        self.ruta_proyecto = None
+        self.accept()
 
     def _refrescar_lista(self):
-        # Limpia lo que hubiera (por si se vuelve a entrar a la lista más
-        # de una vez en la misma sesión de la pantalla de inicio).
         while self._layout_lista.count() > 1:  # deja el addStretch() final
             item = self._layout_lista.takeAt(0)
             if item.widget():
