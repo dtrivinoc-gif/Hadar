@@ -67,6 +67,13 @@ from .limpieza import (
 )
 from .dialogos_limpieza import DialogoRevisarCaracteres
 
+# Texto que representa "valores nulos/vacíos" en el filtro por columna de
+# Datos y en la pestaña Frecuencias. Se trata siempre aparte (nunca como
+# texto real que alguien pueda haber escrito) para no confundir un dato
+# real llamado, por ejemplo, "vacío" con una celda efectivamente vacía.
+VALOR_VACIO_FILTRO = "(vacíos)"
+
+
 class _DialogoElegirHojas(QDialog):
     """
     Cuando un Excel tiene varias hojas, pregunta cuáles cargar:
@@ -2042,9 +2049,12 @@ class HadarApp(QMainWindow):
             self.datos_filter_col.blockSignals(False)
             self.datos_values_list.clear()
             if datos_proyecto.filtro_columna in self.df.columns:
-                vals = sorted(self.df[datos_proyecto.filtro_columna].dropna().unique().tolist(), key=str)
+                columna = self.df[datos_proyecto.filtro_columna]
+                vals = sorted(columna.dropna().unique().tolist(), key=str)
                 for v in vals:
                     self.datos_values_list.addItem(QListWidgetItem(str(v)))
+                if columna.isna().any():
+                    self.datos_values_list.addItem(QListWidgetItem(VALOR_VACIO_FILTRO))
                 self.datos_values_list.blockSignals(True)
                 valores_guardados = {str(v) for v in datos_proyecto.filtro_valores}
                 for i in range(self.datos_values_list.count()):
@@ -2185,10 +2195,13 @@ class HadarApp(QMainWindow):
     def _on_datos_filter_col_change(self, value):
         self.datos_values_list.clear()
         if value and value != "Sin filtro" and self.df is not None:
-            vals = sorted(self.df[value].dropna().unique().tolist(), key=str)
+            columna = self.df[value]
+            vals = sorted(columna.dropna().unique().tolist(), key=str)
             for v in vals:
                 item = QListWidgetItem(str(v))
                 self.datos_values_list.addItem(item)
+            if columna.isna().any():
+                self.datos_values_list.addItem(QListWidgetItem(VALOR_VACIO_FILTRO))
             self.datos_values_list.selectAll()
         self.apply_table_filter()
 
@@ -2218,7 +2231,12 @@ class HadarApp(QMainWindow):
         if col and col != "Sin filtro":
             selected_vals = [item.text() for item in self.datos_values_list.selectedItems()]
             if selected_vals:
-                df = df[df[col].astype(str).isin(selected_vals)]
+                incluir_vacios = VALOR_VACIO_FILTRO in selected_vals
+                valores_normales = [v for v in selected_vals if v != VALOR_VACIO_FILTRO]
+                mascara = df[col].astype(str).isin(valores_normales)
+                if incluir_vacios:
+                    mascara = mascara | df[col].isna()
+                df = df[mascara]
 
         if self.filtro_grafico:
             col_f = self.filtro_grafico["columna"]
@@ -3843,11 +3861,14 @@ class HadarApp(QMainWindow):
         for col in selected_cols:
             if col not in self.filtered_df.columns:
                 continue
-            serie = self.filtered_df[col].dropna().astype(str)
-            total = len(serie)
+            serie_cruda = self.filtered_df[col]
+            total = len(serie_cruda)
             if total == 0:
                 continue
-            counts = serie.value_counts()
+            n_vacios = int(serie_cruda.isna().sum())
+            counts = serie_cruda.dropna().astype(str).value_counts()
+            if n_vacios:
+                counts[VALOR_VACIO_FILTRO] = n_vacios
             if first_col_counts is None:
                 first_col_counts = counts
             for valor, freq in counts.items():
