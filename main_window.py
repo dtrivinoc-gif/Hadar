@@ -50,6 +50,7 @@ from .memoria import MemoriaHadar
 from .proyecto import guardar_proyecto, abrir_proyecto, ruta_carpeta_proyectos, EXTENSION
 from .aprendizaje_adaptativo import actualizar_linea_base
 from .anomalias import SemanticAnomalyDetector, anomalias_a_notas_celda, detectar_columnas_fecha
+from .deteccion_multivariada import evaluar_confiabilidad
 from .dialogos_temporales import ConfigurarRelacionesTemporalesDialog
 from .narrativa import QuestionAssistant, NarrativeGenerator, _decodificar_identidad_anomalia
 from .dialogo_nota import DialogoNota
@@ -303,6 +304,11 @@ class HadarApp(QMainWindow):
         # aprendizaje_adaptativo.py) -- vacía hasta que se guarda o
         # reabre un proyecto con ml_activado=True.
         self.linea_base_ml = {}
+        # Detección multivariada (Isolation Forest, ver deteccion_multivariada.py):
+        # opt-in por dataset, se decide en la pestaña Narrativa (botón con el
+        # termómetro de confiabilidad) -- a diferencia de ml_activado, no se
+        # pregunta una sola vez: se puede prender/apagar en cualquier momento.
+        self.ml_multivariado_activado = False
         # De dónde vino cada tabla ({nombre_tabla: {"tipo": "archivo"|"sql_server", ...}})
         # -- para poder "Actualizar" sin volver a preguntar todo. Nunca
         # incluye contraseñas (ver _DialogoConexionSqlServer).
@@ -1945,6 +1951,7 @@ class HadarApp(QMainWindow):
                 ml_activado=self.ml_activado,
                 linea_base_ml=self.linea_base_ml,
                 fuentes_datos=self.fuentes_datos,
+                ml_multivariado_activado=self.ml_multivariado_activado,
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar el proyecto", str(e))
@@ -1986,6 +1993,9 @@ class HadarApp(QMainWindow):
         self.ml_activado = datos_proyecto.ml_activado
         self.linea_base_ml = datos_proyecto.linea_base_ml
         self.fuentes_datos = datos_proyecto.fuentes_datos
+        self.ml_multivariado_activado = datos_proyecto.ml_multivariado_activado
+        if hasattr(self, "btn_ml_multivariado"):
+            self.btn_ml_multivariado.setChecked(self.ml_multivariado_activado)
         if self.ml_activado:
             # Foto de los datos tal como llegan al abrir -- útil sobre
             # todo cuando el proyecto se actualizó afuera (ej. una BD que
@@ -2639,6 +2649,11 @@ class HadarApp(QMainWindow):
         self.btn_narrativa_exportar_pdf.clicked.connect(self._narrativa_exportar_pdf)
         controls.addWidget(self.btn_narrativa_exportar_pdf)
 
+        self.btn_ml_multivariado = QPushButton("⚙ Detección por combinación (ML)")
+        self.btn_ml_multivariado.setCheckable(True)
+        self.btn_ml_multivariado.toggled.connect(self._alternar_ml_multivariado)
+        controls.addWidget(self.btn_ml_multivariado)
+
         self.lbl_narrativa_estado = QLabel(
             "Genera un informe con los hallazgos automáticos de tus datos actuales."
         )
@@ -2671,6 +2686,55 @@ class HadarApp(QMainWindow):
                 "Los datos cambiaron desde la última narrativa generada. "
                 "Presiona \"Generar Narrativa\" para actualizarla."
             )
+
+    def _alternar_ml_multivariado(self, activar):
+        """Prende/apaga la detección por combinación de columnas (Isolation
+        Forest). Al activarla, corre el auto-test de confiabilidad SOBRE
+        ESTE dataset y le muestra al usuario un número medido de verdad, no
+        una tabla genérica -- ver deteccion_multivariada.evaluar_confiabilidad."""
+        df = self.filtered_df if self.filtered_df is not None else self.df
+        if df is None or df.empty:
+            QMessageBox.information(self, "Sin datos", "Carga datos primero.")
+            self.btn_ml_multivariado.setChecked(False)
+            return
+
+        if activar:
+            resultado = evaluar_confiabilidad(df)
+            if resultado is None:
+                QMessageBox.information(
+                    self, "Dataset muy chico",
+                    "Este dataset no tiene suficientes filas o columnas numéricas para que "
+                    "la detección por combinación (ML) aporte algo confiable."
+                )
+                self.btn_ml_multivariado.setChecked(False)
+                return
+
+            tasa = resultado["tasa_deteccion"] * 100
+            mensaje = (
+                f"Con tus datos actuales, este chequeo detectó el {tasa:.0f}% de las "
+                f"anomalías de prueba fabricadas para medirlo ({resultado['n_pruebas']} pruebas "
+                f"sobre {resultado['n_filas_dataset']:,} filas).\n\n"
+            )
+            mensaje += (
+                "Es un resultado confiable para activarlo en este dataset."
+                if resultado["confiable"] else
+                "Es un resultado bajo -- puede deberse a pocas filas o poca variación entre "
+                "columnas. Activarlo igual es tu decisión, pero puede marcar cosas poco útiles."
+            )
+            respuesta = QMessageBox.question(
+                self, "Detección por combinación de columnas (ML)",
+                mensaje + "\n\n¿Activar este chequeo para la narrativa?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if respuesta != QMessageBox.Yes:
+                self.btn_ml_multivariado.setChecked(False)
+                return
+
+        self.ml_multivariado_activado = activar
+        self.btn_ml_multivariado.setText(
+            "✅ Detección por combinación (ML)" if activar else "⚙ Detección por combinación (ML)"
+        )
+        self._marcar_narrativa_desactualizada()
 
     def _configurar_relaciones_temporales(self):
         df = self.filtered_df if self.filtered_df is not None else self.df
@@ -2708,6 +2772,7 @@ class HadarApp(QMainWindow):
             df, pares_temporales_personalizados=pares_temporales_personalizados,
             linea_base_ml=self.linea_base_ml if self.ml_activado else None,
             nombre_tabla=self.nombre_tabla_activa,
+            ml_multivariado_activado=self.ml_multivariado_activado,
         )
         anomalias = detector.detect_all()
 
@@ -2769,6 +2834,7 @@ class HadarApp(QMainWindow):
                 df_t,
                 linea_base_ml=self.linea_base_ml if self.ml_activado else None,
                 nombre_tabla=nombre_t,
+                ml_multivariado_activado=self.ml_multivariado_activado,
             )
             tablas_relacionadas[nombre_t] = {"df": df_t, "anomalias": detector_t.detect_all()}
 

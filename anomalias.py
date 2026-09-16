@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .aprendizaje_adaptativo import es_anomalo_segun_linea_base
+from .deteccion_multivariada import detectar_anomalias_multivariadas
 
 PROPORCION_MINIMA_FECHA_NARRATIVA = 0.8   # % de valores parseables como fecha
 TAMANO_MUESTRA_DETECCION_FECHA = 3000     # ver detectar_columnas_fecha
@@ -111,7 +112,7 @@ class SemanticAnomalyDetector:
     def __init__(self, df, umbral_z=3.0, minimo_muestras=10,
                  max_anomalias_individuales=5, reglas_negocio=None,
                  pares_temporales_personalizados=None, umbral_minimo_nulos=0.01,
-                 linea_base_ml=None, nombre_tabla=None):
+                 linea_base_ml=None, nombre_tabla=None, ml_multivariado_activado=False):
         self.df = df
         self.umbral_z = umbral_z
         # Con menos muestras que esto, la desviación estándar no es confiable
@@ -141,6 +142,11 @@ class SemanticAnomalyDetector:
         # linea_base_ml -- sin esto no hay forma de saber a qué entrada de
         # la línea base corresponde cada columna.
         self.nombre_tabla = nombre_tabla
+        # Detección multivariada (Isolation Forest, ver deteccion_multivariada.py):
+        # opt-in por dataset, se decide en la pestaña Narrativa según el
+        # resultado del auto-test de confiabilidad -- no depende del proyecto
+        # como linea_base_ml, se puede prender/apagar en cualquier momento.
+        self.ml_multivariado_activado = ml_multivariado_activado
 
     def detect_all(self):
         anomalias = []
@@ -150,7 +156,61 @@ class SemanticAnomalyDetector:
         anomalias += self._check_valores_nulos()
         anomalias += self._check_duplicados()
         anomalias += self._check_linea_base_ml()
+        anomalias += self._check_multivariado_ml()
         return anomalias
+
+    def _check_multivariado_ml(self):
+        if not self.ml_multivariado_activado:
+            return []
+        hallazgos = detectar_anomalias_multivariadas(self.df)
+        if not hallazgos:
+            return []
+
+        total_filas = len(self.df)
+
+        if len(hallazgos) <= self.max_anomalias_individuales:
+            anomalias = []
+            for h in hallazgos:
+                z_max = max((z for _, z in h.columnas_responsables), default=self.umbral_z)
+                pistas = ", ".join(f"'{col}' (z={z:.1f})" for col, z in h.columnas_responsables)
+                anomalias.append({
+                    "tipo": "patron_multivariado",
+                    "columnas": [c for c, _ in h.columnas_responsables],
+                    "descripcion": (
+                        f"En la fila {h.indice + 1}, la combinación de varias columnas es poco "
+                        f"común (ninguna se ve mal por separado). Las más responsables: {pistas}."
+                    ),
+                    "filas_afectadas": 1,
+                    "fila_indice": h.indice,
+                    "indices_atipicos": [h.indice],
+                    "gravedad": "alta" if z_max > self.umbral_z * 2 else "media",
+                    "severidad_impacto": _clasificar_severidad_impacto(z_max, self.umbral_z),
+                })
+            return anomalias
+
+        porcentaje = round(len(hallazgos) / total_filas * 100, 1) if total_filas else 0
+        ejemplos = ", ".join(str(h.indice + 1) for h in hallazgos[:5])
+        frecuencia_columnas = {}
+        for h in hallazgos:
+            for col, _ in h.columnas_responsables:
+                frecuencia_columnas[col] = frecuencia_columnas.get(col, 0) + 1
+        columnas_top = sorted(frecuencia_columnas, key=frecuencia_columnas.get, reverse=True)[:3]
+        z_max_global = max(
+            (z for h in hallazgos for _, z in h.columnas_responsables), default=self.umbral_z
+        )
+        return [{
+            "tipo": "patron_multivariado",
+            "columnas": columnas_top,
+            "descripcion": (
+                f"Se detectaron {len(hallazgos):,} fila(s) con combinaciones poco comunes de "
+                f"columnas ({porcentaje}% de las filas). Las columnas más involucradas: "
+                f"{', '.join(columnas_top)}. Ejemplos de filas: {ejemplos}."
+            ),
+            "filas_afectadas": len(hallazgos),
+            "indices_atipicos": [h.indice for h in hallazgos],
+            "gravedad": "alta" if z_max_global > self.umbral_z * 2 else "media",
+            "severidad_impacto": _clasificar_severidad_impacto(z_max_global, self.umbral_z),
+        }]
 
     def _check_valores_nulos(self):
         anomalias = []

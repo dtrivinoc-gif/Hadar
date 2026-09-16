@@ -44,6 +44,8 @@ class QuestionAssistant:
                 preguntas.append("¿Por qué hay filas duplicadas en los datos?")
             elif a["tipo"] == "deriva_historica":
                 preguntas.append(f"¿Qué cambió de fondo en {cols} respecto de lo que veníamos viendo?")
+            elif a["tipo"] == "patron_multivariado":
+                preguntas.append(f"¿Qué explica que {cols} aparezcan combinadas así en ese registro?")
             else:
                 preguntas.append(f"¿Por qué no se está cumpliendo la regla sobre {cols}?")
 
@@ -101,6 +103,7 @@ _RECOMENDACIONES_BASE_POR_TIPO = {
     "temporal": "Revisar el proceso de captura de fechas en este paso.",
     "quiebre_patron": "Revisar qué ocurrió puntualmente en este registro.",
     "deriva_historica": "Revisar si algo cambió de fondo en este dato (proceso, fuente, medición) desde la última vez.",
+    "patron_multivariado": "Revisar la combinación de columnas señalada -- por separado cada una se ve normal, pero juntas no.",
 }
 
 
@@ -403,6 +406,32 @@ def _grafico_narrativa_barras(etiquetas, valores, colores=None, titulo="", ancho
         return None
 
 
+def _grafico_narrativa_dispersion(x, y, x_resaltar=None, y_resaltar=None, titulo="", ancho=420, alto=300):
+    """Dispersión de dos columnas numéricas, con la fila atípica marcada en
+    rojo -- pensado para 'patron_multivariado', donde lo raro es la
+    COMBINACIÓN de dos valores, no cada uno por separado."""
+    try:
+        import pyqtgraph.exporters as pg_exporters
+        pw = pg.PlotWidget()
+        pw.resize(ancho, alto)
+        pw.setBackground('w')
+        pw.showGrid(x=True, y=True, alpha=0.15)
+        pw.getAxis('bottom').setPen(pg.mkPen('#9ca3af'))
+        pw.getAxis('left').setPen(pg.mkPen('#9ca3af'))
+        pw.addItem(pg.ScatterPlotItem(list(x), list(y), brush=pg.mkBrush('#9ca3af'),
+                                       pen=None, size=6))
+        if x_resaltar is not None and y_resaltar is not None:
+            pw.addItem(pg.ScatterPlotItem([x_resaltar], [y_resaltar], brush=pg.mkBrush('#dc2626'),
+                                           pen=pg.mkPen('#dc2626'), size=10))
+        if titulo:
+            pw.setTitle(titulo, color='#374151', size='8pt')
+        exportador = pg_exporters.ImageExporter(pw.getPlotItem())
+        exportador.parameters()['width'] = ancho
+        return _imagen_qt_a_data_uri(exportador.export(toBytes=True))
+    except Exception:
+        return None
+
+
 def _grafico_anomalia_narrativa(anomalia, df):
     """Arma el gráfico que corresponde según el tipo de anomalía, usando los
     datos reales del df. Devuelve HTML (un <img> o cadena vacía) -- nunca
@@ -446,6 +475,16 @@ def _grafico_anomalia_narrativa(anomalia, df):
             uri = _grafico_narrativa_barras(
                 ["Únicas", "Duplicadas"], [n_unicas, n_dup],
                 colores=["#9ca3af", "#dc2626"], titulo="Filas únicas vs. duplicadas",
+            )
+        elif tipo == "patron_multivariado" and len(columnas) >= 2 and anomalia.get("fila_indice") is not None:
+            col_x, col_y = columnas[0], columnas[1]
+            serie_x = pd.to_numeric(df[col_x], errors="coerce")
+            serie_y = pd.to_numeric(df[col_y], errors="coerce")
+            fila = anomalia["fila_indice"]
+            uri = _grafico_narrativa_dispersion(
+                serie_x.dropna(), serie_y.dropna(),
+                x_resaltar=serie_x.get(fila), y_resaltar=serie_y.get(fila),
+                titulo=f"'{col_x}' vs '{col_y}'",
             )
         else:
             uri = None
@@ -969,6 +1008,11 @@ class NarrativeGenerator:
             recomendaciones.append(
                 "Este proyecto tiene aprendizaje continuo activado: algo se salió del comportamiento "
                 "histórico propio de estos datos, no solo de un umbral genérico."
+            )
+        if "patron_multivariado" in tipos_presentes:
+            recomendaciones.append(
+                "Algunas filas fueron marcadas por una combinación poco común de columnas, "
+                "no por un valor extremo en una sola -- revísalas con ese criterio en mente."
             )
         if not recomendaciones:
             recomendaciones.append("No se detectaron problemas relevantes con las reglas actuales.")

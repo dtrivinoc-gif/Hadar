@@ -72,7 +72,8 @@ def ruta_carpeta_proyectos():
 
 def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
                       filtro_columna, filtro_valores, notas_manuales, indicadores,
-                      ml_activado=False, linea_base_ml=None, fuentes_datos=None):
+                      ml_activado=False, linea_base_ml=None, fuentes_datos=None,
+                      ml_multivariado_activado=False):
     """
     ... (ver parámetros existentes arriba)
     fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server", ...}}
@@ -99,6 +100,7 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         "ml_activado": bool(ml_activado),
         "linea_base_ml": linea_base_ml or {},
         "fuentes_datos": fuentes_datos or {},
+        "ml_multivariado_activado": bool(ml_multivariado_activado),
     }
 
     carpeta = os.path.dirname(ruta)
@@ -119,7 +121,8 @@ class ProyectoCargado:
 
     def __init__(self, tablas, nombre_tabla_activa, relaciones_ontologia,
                  filtro_columna, filtro_valores, notas_manuales, indicadores_dict,
-                 ml_activado=False, linea_base_ml=None, fuentes_datos=None):
+                 ml_activado=False, linea_base_ml=None, fuentes_datos=None,
+                 ml_multivariado_activado=False):
         self.tablas = tablas
         self.nombre_tabla_activa = nombre_tabla_activa
         self.relaciones_ontologia = relaciones_ontologia
@@ -130,6 +133,7 @@ class ProyectoCargado:
         self.ml_activado = ml_activado
         self.linea_base_ml = linea_base_ml or {}
         self.fuentes_datos = fuentes_datos or {}
+        self.ml_multivariado_activado = ml_multivariado_activado
 
 
 def abrir_proyecto(ruta):
@@ -164,6 +168,7 @@ def abrir_proyecto(ruta):
             ml_activado=metadata.get("ml_activado", False),
             linea_base_ml=metadata.get("linea_base_ml", {}),
             fuentes_datos=metadata.get("fuentes_datos", {}),
+            ml_multivariado_activado=metadata.get("ml_multivariado_activado", False),
         )
 
 
