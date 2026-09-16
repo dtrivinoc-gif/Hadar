@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QInputDialog, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QTabBar, QDialog, QApplication, QTextBrowser,
     QDialogButtonBox, QToolButton, QMenu, QFormLayout,
+    QTreeWidget, QTreeWidgetItem,
 )
 from PySide6.QtPrintSupport import QPrinter
 
@@ -35,6 +36,7 @@ from .config import (
 from .io_datos import (
     SqlMultipleTablesError, read_sql_file, load_data, _excel_sheet_names,
     SqlServerNoDisponible, listar_tablas_sql_server, leer_tabla_sql_server,
+    cast_valor_a_dtype,
 )
 from .table_model import PandasTableModel
 from .graficos import UfWorker, ChartPanel, render_boxplot, build_stylesheet, create_stat_card, set_card_alarma
@@ -55,7 +57,8 @@ from .dialogos_temporales import ConfigurarRelacionesTemporalesDialog
 from .narrativa import QuestionAssistant, NarrativeGenerator, _decodificar_identidad_anomalia
 from .dialogo_nota import DialogoNota
 from .ontologia_ui import DialogoEsquemaOntologia
-from .ontologia import inferir_relaciones
+from .ontologia import inferir_relaciones, enriquecer_tabla_con_relaciones
+from .contagio import explorar_linaje, columna_clave_de_tabla
 from .alarmas import AlarmaHadar, AlarmaCard, DialogoAlarma, calcular_valor_actual, evaluar_regla
 from .notificaciones import DialogoConfiguracionCorreo, disparar_envio_correo, cargar_configuracion
 from .linea_tiempo_ui import LineaTiempoPanel
@@ -90,6 +93,22 @@ ETIQUETAS_TIPO_ANOMALIA = {
 # Diccionario inverso: etiqueta legible -> clave interna, para traducir de
 # vuelta lo que el usuario elige en el combo.
 _ETIQUETAS_TIPO_ANOMALIA_INVERSA = {v: k for k, v in ETIQUETAS_TIPO_ANOMALIA.items()}
+
+
+def _todos_los_indices_anomalos(anomalias_lista):
+    """Índices de fila (los mismos que usa el .index del DataFrame de esa
+    tabla) de TODAS las anomalías de una lista, sin importar el tipo.
+    Usado para armar self._anomalias_por_tabla, que es lo que la
+    sub-pestaña Linaje usa para marcar qué filas están conectadas con
+    alguna anomalía."""
+    indices = set()
+    for a in anomalias_lista:
+        idxs = a.get("indices_atipicos")
+        if idxs is None:
+            idx_unico = a.get("fila_indice")
+            idxs = [idx_unico] if idx_unico is not None else []
+        indices.update(idxs)
+    return indices
 
 
 class _DialogoElegirHojas(QDialog):
@@ -2308,10 +2327,16 @@ class HadarApp(QMainWindow):
         donde se carga un dataset nuevo o se cambia de tabla activa: los
         índices que guarda self._ultimas_anomalias son de OTRO dataset, así
         que seguir mostrando ese filtro llevaría a resultados sin sentido
-        (o directamente vacíos). Se limpia en vez de arrastrarlo."""
+        (o directamente vacíos). Se limpia en vez de arrastrarlo. Por la
+        misma razón, la sub-pestaña Linaje (que también depende de la
+        última Narrativa generada) se desactiva hasta que se vuelva a
+        generar sobre los datos nuevos."""
         self._ultimas_anomalias = []
+        self._anomalias_por_tabla = {}
+        self._linaje_disponible = False
         self._repoblar_filtro_anomalias()
         self._actualizar_resumen_anomalias_frecuencias()
+        self._actualizar_estado_linaje()
 
     def _construir_df_filtrado_base(self):
         """DataFrame filtrado por TODO lo de la pestaña Datos (buscador de
@@ -2817,6 +2842,17 @@ class HadarApp(QMainWindow):
         controls.addStretch()
         layout.addLayout(controls)
 
+        # Informe y Linaje son sub-pestañas DENTRO de Narrativa (no
+        # pestañas del nivel superior): Linaje solo tiene sentido después
+        # de generar un informe (necesita self._anomalias_por_tabla y las
+        # relaciones ya calculadas), así que vivir junto al informe dentro
+        # del mismo botón "Generar Narrativa" deja esa dependencia clara,
+        # en vez de una pestaña suelta que se ve rota si se abre primero.
+        self.subtabs_narrativa = QTabWidget()
+        layout.addWidget(self.subtabs_narrativa, stretch=1)
+
+        tab_informe = QWidget()
+        layout_informe = QVBoxLayout(tab_informe)
         self.narrativa_browser = QTextBrowser()
         self.narrativa_browser.setOpenExternalLinks(False)
         # Los enlaces "Marcar como resuelta" no son páginas de verdad, así que
@@ -2824,12 +2860,205 @@ class HadarApp(QMainWindow):
         self.narrativa_browser.setOpenLinks(False)
         self.narrativa_browser.anchorClicked.connect(self._on_narrativa_anchor_clicked)
         self.narrativa_browser.setMinimumHeight(400)
-        layout.addWidget(self.narrativa_browser, stretch=1)
+        layout_informe.addWidget(self.narrativa_browser)
+        self.subtabs_narrativa.addTab(tab_informe, "Informe")
+
+        tab_linaje = QWidget()
+        self._build_subtab_linaje(tab_linaje)
+        self.subtabs_narrativa.addTab(tab_linaje, "Linaje")
 
         self._narrativa_actualizada = False
         self._ultimas_anomalias = []
+        self._anomalias_por_tabla = {}
+        self._linaje_disponible = False
         self._ultimo_df_narrativa = None
         self._ultimo_nombre_dataset_narrativa = "tu dataset"
+        self._actualizar_estado_linaje()
+
+    def _build_subtab_linaje(self, tab):
+        """Sub-pestaña 'Linaje' de Narrativa: parte de UN registro puntual
+        (por ID, o eligiéndolo directamente de la lista de anomalías) y
+        muestra en una lista anidada (con sangría, sin líneas ni flechas)
+        todo lo que está conectado con él a través de las relaciones ya
+        confirmadas -- hacia tablas padre Y tablas hijas. A propósito es
+        una lista, no un grafo dibujado: la relación real entre registros
+        casi siempre es un árbol, y una lista anidada se lee sin ambigüedad
+        de layout ni líneas cruzándose."""
+        layout = QVBoxLayout(tab)
+
+        self.lbl_linaje_estado = QLabel(
+            "Genera Narrativa primero -- Linaje necesita las relaciones y anomalías de tu último informe."
+        )
+        self.lbl_linaje_estado.setObjectName("muted")
+        layout.addWidget(self.lbl_linaje_estado)
+
+        buscar_row = QHBoxLayout()
+        buscar_row.addWidget(QLabel("Tabla:"))
+        self.combo_linaje_tabla = QComboBox()
+        self.combo_linaje_tabla.currentTextChanged.connect(self._on_linaje_tabla_change)
+        buscar_row.addWidget(self.combo_linaje_tabla)
+
+        buscar_row.addWidget(QLabel("Columna:"))
+        self.combo_linaje_columna = QComboBox()
+        buscar_row.addWidget(self.combo_linaje_columna)
+
+        buscar_row.addWidget(QLabel("Valor (ID):"))
+        self.txt_linaje_valor = QLineEdit()
+        self.txt_linaje_valor.setPlaceholderText("ej. 102")
+        self.txt_linaje_valor.returnPressed.connect(self._buscar_linaje)
+        buscar_row.addWidget(self.txt_linaje_valor)
+
+        self.btn_linaje_buscar = QPushButton("Ver linaje")
+        self.btn_linaje_buscar.clicked.connect(self._buscar_linaje)
+        buscar_row.addWidget(self.btn_linaje_buscar)
+        buscar_row.addStretch()
+        layout.addLayout(buscar_row)
+
+        cuerpo = QHBoxLayout()
+
+        columna_izq = QVBoxLayout()
+        columna_izq.addWidget(QLabel("O elige una anomalía detectada:"))
+        self.lista_linaje_anomalias = QListWidget()
+        self.lista_linaje_anomalias.setMaximumWidth(320)
+        self.lista_linaje_anomalias.itemDoubleClicked.connect(self._on_linaje_anomalia_elegida)
+        columna_izq.addWidget(self.lista_linaje_anomalias)
+        cuerpo.addLayout(columna_izq)
+
+        self.arbol_linaje = QTreeWidget()
+        self.arbol_linaje.setHeaderLabels(["Registro conectado"])
+        self.arbol_linaje.setColumnCount(1)
+        cuerpo.addWidget(self.arbol_linaje, stretch=1)
+
+        layout.addLayout(cuerpo, stretch=1)
+
+        self._controles_linaje = [
+            self.combo_linaje_tabla, self.combo_linaje_columna, self.txt_linaje_valor,
+            self.btn_linaje_buscar, self.lista_linaje_anomalias,
+        ]
+
+    def _actualizar_estado_linaje(self):
+        """Habilita o deshabilita toda la sub-pestaña Linaje según si hay
+        un informe de Narrativa generado sobre los datos actuales
+        (self._linaje_disponible). Se llama tanto al generar Narrativa como
+        en cada punto donde esos datos quedan obsoletos (ver
+        _resetear_filtro_anomalias)."""
+        if not hasattr(self, "lbl_linaje_estado"):
+            return  # la sub-pestaña todavía no se construyó
+        disponible = bool(self._linaje_disponible)
+        for w in self._controles_linaje:
+            w.setEnabled(disponible)
+        self.arbol_linaje.setEnabled(disponible)
+        if disponible:
+            self.lbl_linaje_estado.setText(
+                "Elige una tabla y un ID, o doble clic en una anomalía de la izquierda."
+            )
+        else:
+            self.arbol_linaje.clear()
+            self.lista_linaje_anomalias.clear()
+            self.lbl_linaje_estado.setText(
+                "Genera Narrativa primero -- Linaje necesita las relaciones y anomalías de tu último informe."
+            )
+
+    def _poblar_linaje_tras_narrativa(self):
+        """Se llama al final de _generar_narrativa(): repuebla los combos
+        de tabla/columna y la lista de anomalías clicables de Linaje con lo
+        recién calculado."""
+        self.combo_linaje_tabla.blockSignals(True)
+        self.combo_linaje_tabla.clear()
+        self.combo_linaje_tabla.addItems(sorted(self.tablas.keys()))
+        self.combo_linaje_tabla.setCurrentText(self.nombre_tabla_activa)
+        self.combo_linaje_tabla.blockSignals(False)
+        self._on_linaje_tabla_change(self.nombre_tabla_activa)
+
+        self.lista_linaje_anomalias.clear()
+        for a in self._ultimas_anomalias:
+            idxs = a.get("indices_atipicos")
+            idx_unico = idxs[0] if idxs else a.get("fila_indice")
+            if idx_unico is None:
+                continue
+            etiqueta = ETIQUETAS_TIPO_ANOMALIA.get(a.get("tipo"), a.get("tipo") or "Anomalía")
+            item = QListWidgetItem(f"{etiqueta} — {self.nombre_tabla_activa} (fila {idx_unico})")
+            item.setData(Qt.ItemDataRole.UserRole, (self.nombre_tabla_activa, idx_unico))
+            self.lista_linaje_anomalias.addItem(item)
+
+    def _on_linaje_tabla_change(self, nombre_tabla):
+        self.combo_linaje_columna.clear()
+        df_t = self.tablas.get(nombre_tabla)
+        if df_t is None:
+            return
+        self.combo_linaje_columna.addItems([str(c) for c in df_t.columns])
+        relaciones = (
+            self.relaciones_ontologia if self.relaciones_ontologia is not None
+            else inferir_relaciones(self.tablas)
+        )
+        columna_sugerida = columna_clave_de_tabla(nombre_tabla, relaciones)
+        if columna_sugerida and columna_sugerida in df_t.columns:
+            self.combo_linaje_columna.setCurrentText(columna_sugerida)
+
+    def _on_linaje_anomalia_elegida(self, item):
+        nombre_tabla, indice_fila = item.data(Qt.ItemDataRole.UserRole)
+        df_t = self.tablas.get(nombre_tabla)
+        if df_t is None or indice_fila not in df_t.index:
+            return
+        self.combo_linaje_tabla.setCurrentText(nombre_tabla)  # repuebla combo_linaje_columna con la sugerida
+        columna = self.combo_linaje_columna.currentText() or df_t.columns[0]
+        if columna not in df_t.columns:
+            return
+        valor = df_t.at[indice_fila, columna]
+        self.txt_linaje_valor.setText(str(valor))
+        self._buscar_linaje()
+
+    def _buscar_linaje(self):
+        tabla = self.combo_linaje_tabla.currentText()
+        columna = self.combo_linaje_columna.currentText()
+        texto_valor = self.txt_linaje_valor.text().strip()
+        df_t = self.tablas.get(tabla)
+        if not tabla or not columna or not texto_valor or df_t is None:
+            return
+
+        valor = cast_valor_a_dtype(texto_valor, df_t[columna].dtype)
+        relaciones = (
+            self.relaciones_ontologia if self.relaciones_ontologia is not None
+            else inferir_relaciones(self.tablas)
+        )
+        raiz = explorar_linaje(
+            tabla, valor, columna, self.tablas, relaciones,
+            filas_anomalas=self._anomalias_por_tabla,
+        )
+        self.arbol_linaje.clear()
+        if raiz is None:
+            self.lbl_linaje_estado.setText(f'La columna "{columna}" no existe en {tabla}.')
+            return
+        if raiz.indice_fila is None:
+            self.lbl_linaje_estado.setText(f'No se encontró {columna} = "{texto_valor}" en {tabla}.')
+            return
+
+        self.lbl_linaje_estado.setText(
+            "Elige una tabla y un ID, o doble clic en una anomalía de la izquierda."
+        )
+        item_raiz = self._construir_item_linaje(raiz)
+        self.arbol_linaje.addTopLevelItem(item_raiz)
+        self.arbol_linaje.expandAll()
+
+    def _construir_item_linaje(self, nodo):
+        """Arma recursivamente el QTreeWidgetItem de un nodo Y todos sus
+        hijos -- el árbol completo ya está en memoria (explorar_linaje ya
+        lo acotó con max_saltos/max_nodos_total), así que no hace falta
+        expansión perezosa. El punto rojo reutiliza el mismo ícono que ya
+        se usa en la pestaña Datos para anomalías: es información real
+        (esta fila tiene una anomalía detectada), no una decoración nueva."""
+        prefijo = "● " if nodo.relacion_con_padre is None else (
+            "↑ " if nodo.relacion_con_padre == "padre" else "↓ "
+        )
+        texto = f"{prefijo}{nodo.tabla} — {nodo.columna_clave} = {nodo.valor_clave}"
+        if nodo.truncado:
+            texto += "  (hay más, no se muestran todas)"
+        item = QTreeWidgetItem([texto])
+        if nodo.es_anomalia:
+            item.setIcon(0, self.table_model.icono_anomalia())
+        for hijo in nodo.hijos:
+            item.addChild(self._construir_item_linaje(hijo))
+        return item
 
     def _marcar_narrativa_desactualizada(self):
         """Los datos/filtros cambiaron desde la última narrativa generada:
@@ -2945,6 +3174,9 @@ class HadarApp(QMainWindow):
         self._ultimo_df_narrativa = df
         self._ultimo_nombre_dataset_narrativa = nombre_dataset
         self._narrativa_actualizada = True
+        self._linaje_disponible = True
+        self._actualizar_estado_linaje()
+        self._poblar_linaje_tras_narrativa()
 
         # Habilita/repuebla el filtro "Anomalía" de Datos y el resumen de
         # anomalías de Frecuencias con lo recién calculado -- ambos leen
@@ -2985,26 +3217,58 @@ class HadarApp(QMainWindow):
         tienen sentido dentro de la app (ej. "Marcar como resuelta"),
         pensada para exportar a PDF o imprimir."""
         if len(self.tablas) <= 1:
+            self._anomalias_por_tabla = {
+                self.nombre_tabla_activa: _todos_los_indices_anomalos(anomalias)
+            }
             return NarrativeGenerator(
                 df, anomalias, indicadores=self.indicadores, modo_impresion=modo_impresion,
             ).generar_html(nombre_dataset)
-
-        tablas_relacionadas = {}
-        for nombre_t, df_t in self.tablas.items():
-            if nombre_t == self.nombre_tabla_activa:
-                continue
-            detector_t = SemanticAnomalyDetector(
-                df_t,
-                linea_base_ml=self.linea_base_ml if self.ml_activado else None,
-                nombre_tabla=nombre_t,
-                ml_multivariado_activado=self.ml_multivariado_activado,
-            )
-            tablas_relacionadas[nombre_t] = {"df": df_t, "anomalias": detector_t.detect_all()}
 
         relaciones = (
             self.relaciones_ontologia if self.relaciones_ontologia is not None
             else inferir_relaciones(self.tablas)
         )
+
+        tablas_relacionadas = {}
+        self._anomalias_por_tabla = {
+            self.nombre_tabla_activa: _todos_los_indices_anomalos(anomalias)
+        }
+        for nombre_t, df_t in self.tablas.items():
+            if nombre_t == self.nombre_tabla_activa:
+                continue
+            # El interruptor de ML (self.ml_multivariado_activado) se probó
+            # y confirmó solo sobre la tabla activa (ver _alternar_ml_multivariado).
+            # Antes se aplicaba igual a TODAS las demás tablas sin medir nada
+            # ahí: podía activarse "a ciegas" en una tabla donde el mismo
+            # chequeo de confiabilidad habría dado un resultado bajo. Ahora
+            # se vuelve a medir para esta tabla en particular (barato: usa
+            # muestra y pocos árboles, ver evaluar_confiabilidad) y solo se
+            # activa si el resultado es confiable para ELLA.
+            #
+            # Además (v1 simple, ver ontologia.enriquecer_tabla_con_relaciones):
+            # si esta tabla es la "principal" de alguna relación 1-a-muchos
+            # con dirección clara, el ML no la mira sola -- la mira con
+            # columnas extra resumiendo sus tablas hijas (cantidad, suma,
+            # promedio), igual que hace Foundry al aplanar su Ontología
+            # antes de correr el modelo. El resto de los chequeos (reglas,
+            # nulos, duplicados) siguen viendo la tabla tal cual, sin tocar.
+            df_t_para_ml = enriquecer_tabla_con_relaciones(nombre_t, self.tablas, relaciones)
+            ml_confiable_para_esta_tabla = False
+            if self.ml_multivariado_activado:
+                resultado_ml_tabla = evaluar_confiabilidad(df_t_para_ml)
+                ml_confiable_para_esta_tabla = bool(
+                    resultado_ml_tabla and resultado_ml_tabla["confiable"]
+                )
+            detector_t = SemanticAnomalyDetector(
+                df_t,
+                linea_base_ml=self.linea_base_ml if self.ml_activado else None,
+                nombre_tabla=nombre_t,
+                ml_multivariado_activado=ml_confiable_para_esta_tabla,
+                df_multivariado=df_t_para_ml,
+            )
+            anomalias_t = detector_t.detect_all()
+            tablas_relacionadas[nombre_t] = {"df": df_t, "anomalias": anomalias_t}
+            self._anomalias_por_tabla[nombre_t] = _todos_los_indices_anomalos(anomalias_t)
 
         return NarrativeGenerator(
             df, anomalias,

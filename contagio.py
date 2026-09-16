@@ -186,6 +186,153 @@ def calcular_indice_contagio(
     return resultado
 
 
+def _padres_de(tabla: str, relaciones: list[RelacionSugerida]):
+    """
+    Complemento de _hijos_de: para una tabla que NO es la 'principal' en
+    una relación (o sea, es el lado 'muchos' que referencia a otra por una
+    columna tipo llave foránea), devuelve por dónde subir hacia su tabla
+    padre: lista de (columna_en_tabla, tabla_padre, columna_en_tabla_padre).
+    """
+    padres = []
+    for r in relaciones:
+        if r.tabla_principal is None or r.tabla_principal == tabla:
+            continue
+        if r.tabla_origen == tabla and r.tabla_destino == r.tabla_principal:
+            padres.append((r.columna_origen, r.tabla_destino, r.columna_destino))
+        elif r.tabla_destino == tabla and r.tabla_origen == r.tabla_principal:
+            padres.append((r.columna_destino, r.tabla_origen, r.columna_origen))
+    return padres
+
+
+@dataclass
+class NodoLinaje:
+    """Un nodo del árbol que arma explorar_linaje(). A propósito es un
+    ÁRBOL (no un grafo libre de nodos y líneas): la gran mayoría de los
+    casos reales no tienen ciclos, y una lista anidada con sangría se lee
+    de arriba hacia abajo sin ambigüedad de layout -- a diferencia de un
+    grafo dibujado con líneas cruzándose."""
+    tabla: str
+    columna_clave: str
+    valor_clave: object
+    indice_fila: object              # índice real en tablas[tabla], o None si no se encontró la fila
+    es_anomalia: bool
+    relacion_con_padre: str | None   # "hijo" o "padre" (respecto al nodo de arriba en el árbol), None en la raíz
+    hijos: list = None
+    truncado: bool = False           # True si había más filas relacionadas de las que se muestran acá
+
+    def __post_init__(self):
+        if self.hijos is None:
+            self.hijos = []
+
+
+def explorar_linaje(
+    tabla_inicial: str,
+    valor_id_inicial,
+    columna_id_inicial: str,
+    tablas: dict[str, pd.DataFrame],
+    relaciones: list[RelacionSugerida],
+    filas_anomalas: dict | None = None,
+    max_saltos: int = 2,
+    max_ramas_por_nodo: int = 8,
+    max_nodos_total: int = 60,
+) -> "NodoLinaje | None":
+    """
+    Motor de la sub-pestaña "Linaje" de Narrativa. A diferencia de
+    calcular_indice_contagio (que solo mira hacia tablas HIJAS, para medir
+    impacto en cascada de una anomalía puntual), esto camina en AMBOS
+    sentidos -- también hacia tablas padre -- porque el objetivo acá es
+    otro: partiendo de un ID (o de una fila anómala puntual), mostrar todo
+    lo que está conectado con él, no solo lo que depende de él.
+
+    Se corta con max_saltos (profundidad del árbol), max_ramas_por_nodo
+    (cuántas filas relacionadas se muestran como máximo desde un mismo
+    nodo -- para no listar 10.000 pedidos de un cliente) y max_nodos_total
+    (tope duro de todo el árbol junto). Cuando se corta algo, el nodo
+    afectado queda con truncado=True para que la interfaz pueda avisar
+    "hay más de las que se muestran".
+
+    filas_anomalas: {nombre_tabla: set(índices anómalos en esa tabla)} --
+    típicamente self._anomalias_por_tabla en main_window.py. Si se omite,
+    ningún nodo se marca como anómalo (el árbol igual se arma).
+
+    Devuelve None si tabla_inicial/columna_id_inicial no existen.
+    """
+    df_inicial = tablas.get(tabla_inicial)
+    if df_inicial is None or columna_id_inicial not in df_inicial.columns:
+        return None
+
+    filas_anomalas = filas_anomalas or {}
+
+    def es_anomala(tabla, indice):
+        return indice is not None and indice in filas_anomalas.get(tabla, set())
+
+    coincidencias = df_inicial.index[df_inicial[columna_id_inicial] == valor_id_inicial]
+    indice_inicial = coincidencias[0] if len(coincidencias) else None
+
+    utilizables = _relaciones_utilizables(relaciones)
+    contador_nodos = [1]  # ya cuenta la raíz
+
+    raiz = NodoLinaje(
+        tabla=tabla_inicial, columna_clave=columna_id_inicial, valor_clave=valor_id_inicial,
+        indice_fila=indice_inicial, es_anomalia=es_anomala(tabla_inicial, indice_inicial),
+        relacion_con_padre=None,
+    )
+    if indice_inicial is None:
+        return raiz  # el ID no existe en la tabla -- árbol de un solo nodo, sin hijos
+
+    def expandir(nodo: NodoLinaje, visitados: set, salto: int):
+        if salto >= max_saltos or contador_nodos[0] >= max_nodos_total:
+            return
+        df_actual = tablas.get(nodo.tabla)
+        if df_actual is None:
+            return
+
+        conexiones = (
+            [(c, t, ch, "hijo") for c, t, ch in _hijos_de(nodo.tabla, utilizables)]
+            + [(c, t, ch, "padre") for c, t, ch in _padres_de(nodo.tabla, utilizables)]
+        )
+
+        for col_propia, tabla_vecina, col_vecina, tipo in conexiones:
+            if col_propia not in df_actual.columns:
+                continue
+            valor_propio = df_actual.at[nodo.indice_fila, col_propia]
+            if pd.isna(valor_propio):
+                continue
+            df_vecina = tablas.get(tabla_vecina)
+            if df_vecina is None or col_vecina not in df_vecina.columns:
+                continue
+
+            # No volver por donde se vino (evita el rebote padre->hijo->el mismo padre).
+            indices_vecinos = [
+                i for i in df_vecina.index[df_vecina[col_vecina] == valor_propio]
+                if (tabla_vecina, i) not in visitados
+            ]
+            if not indices_vecinos:
+                continue
+
+            truncado_aqui = len(indices_vecinos) > max_ramas_por_nodo
+            for indice_vecino in indices_vecinos[:max_ramas_por_nodo]:
+                if contador_nodos[0] >= max_nodos_total:
+                    truncado_aqui = True
+                    break
+                hijo = NodoLinaje(
+                    tabla=tabla_vecina, columna_clave=col_vecina,
+                    valor_clave=df_vecina.at[indice_vecino, col_vecina],
+                    indice_fila=indice_vecino,
+                    es_anomalia=es_anomala(tabla_vecina, indice_vecino),
+                    relacion_con_padre=tipo,
+                )
+                contador_nodos[0] += 1
+                nodo.hijos.append(hijo)
+                visitados.add((tabla_vecina, indice_vecino))
+                expandir(hijo, visitados, salto + 1)
+            if truncado_aqui:
+                nodo.truncado = True
+
+    expandir(raiz, {(tabla_inicial, indice_inicial)}, 0)
+    return raiz
+
+
 def resumen_en_texto(resultado: list[TablaInfectada]) -> str:
     """
     Frase lista para mostrar en el informe. En vez de solo contar filas,

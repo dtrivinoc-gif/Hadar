@@ -62,6 +62,13 @@ class PandasTableModel(QAbstractTableModel):
         painter.end()
         return pixmap
 
+    def icono_anomalia(self):
+        """Getter público del punto rojo que ya se usa en la pestaña Datos
+        para anomalías -- lo reutiliza, por ejemplo, la sub-pestaña Linaje
+        de Narrativa, para que el mismo color signifique lo mismo en toda
+        la app."""
+        return self._icono_anomalia
+
     def _clave(self, row, col):
         try:
             return (self._df.index[row], self._df.columns[col])
