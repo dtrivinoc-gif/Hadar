@@ -112,8 +112,17 @@ class SemanticAnomalyDetector:
     def __init__(self, df, umbral_z=3.0, minimo_muestras=10,
                  max_anomalias_individuales=5, reglas_negocio=None,
                  pares_temporales_personalizados=None, umbral_minimo_nulos=0.01,
-                 linea_base_ml=None, nombre_tabla=None, ml_multivariado_activado=False):
+                 linea_base_ml=None, nombre_tabla=None, ml_multivariado_activado=False,
+                 df_multivariado=None):
         self.df = df
+        # Tabla que usa el chequeo de ML (_check_multivariado_ml). Por
+        # defecto es la misma self.df de siempre -- pero si viene una
+        # tabla "enriquecida" con columnas resumen de sus tablas
+        # relacionadas (ver ontologia.enriquecer_tabla_con_relaciones), el
+        # ML la usa a ELLA, mientras que todos los demás chequeos (reglas,
+        # nulos, duplicados, etc.) siguen mirando la tabla original tal
+        # cual, sin las columnas agregadas.
+        self.df_multivariado = df_multivariado if df_multivariado is not None else df
         self.umbral_z = umbral_z
         # Con menos muestras que esto, la desviación estándar no es confiable
         # y no se revisa esa columna (evita falsos positivos con pocos datos).
@@ -162,11 +171,11 @@ class SemanticAnomalyDetector:
     def _check_multivariado_ml(self):
         if not self.ml_multivariado_activado:
             return []
-        hallazgos = detectar_anomalias_multivariadas(self.df)
+        hallazgos = detectar_anomalias_multivariadas(self.df_multivariado)
         if not hallazgos:
             return []
 
-        total_filas = len(self.df)
+        total_filas = len(self.df_multivariado)
 
         if len(hallazgos) <= self.max_anomalias_individuales:
             anomalias = []
@@ -577,12 +586,26 @@ def buscar_coincidencias(df, anomalia, max_coincidencias=1, z_minimo=2.0):
 
 def anomalias_a_notas_celda(anomalias, df, limite_por_anomalia=300):
     """Traduce la lista de anomalías detectadas a notas de celda concretas
-    (fila, columna, texto) para pintarlas en la pestaña Datos. Se apoya en
-    'indices_atipicos' (o 'fila_indice' para el caso de una sola fila) y
-    'columnas', que cada chequeo de SemanticAnomalyDetector ya deja listos
-    en su diccionario -- así que agregar un chequeo nuevo alcanza con que
-    también rellene esos dos campos para que aparezca marcado en Datos."""
-    notas = []
+    (fila, columna, texto, exclusiva_ml) para pintarlas en la pestaña
+    Datos. Se apoya en 'indices_atipicos' (o 'fila_indice' para el caso de
+    una sola fila) y 'columnas', que cada chequeo de SemanticAnomalyDetector
+    ya deja listos en su diccionario -- así que agregar un chequeo nuevo
+    alcanza con que también rellene esos dos campos para que aparezca
+    marcado en Datos.
+
+    'exclusiva_ml' es True solo cuando la ÚNICA razón por la que esa celda
+    quedó marcada es el chequeo de combinación (ML, tipo "patron_multivariado")
+    -- si la misma celda también la marcó cualquier otro chequeo (reglas,
+    quiebre de patrón, nulos, etc.), se considera hallazgo "normal", no
+    exclusivo de ML, aunque ML también la haya encontrado. Pensado para que
+    la pestaña Datos pueda pintar de un rojo distinto lo que SOLO el ML
+    encontró, reservando el rojo de siempre para todo lo demás."""
+    # (idx, col) -> True si hasta ahora todas las anomalías que tocaron esa
+    # celda fueron "patron_multivariado"; False en cuanto aparece cualquier
+    # otro tipo.
+    solo_ml_por_celda: dict[tuple, bool] = {}
+    notas_crudas = []  # (idx, col, texto) en orden, para no perder nada
+
     for a in anomalias:
         indices = a.get("indices_atipicos")
         if indices is None:
@@ -594,9 +617,19 @@ def anomalias_a_notas_celda(anomalias, df, limite_por_anomalia=300):
         if not columnas:
             continue
         texto = a["descripcion"]
+        es_ml = a.get("tipo") == "patron_multivariado"
         for idx in indices[:limite_por_anomalia]:
             if idx not in df.index:
                 continue
             for col in columnas:
-                notas.append((idx, col, texto))
-    return notas
+                clave = (idx, col)
+                if clave not in solo_ml_por_celda:
+                    solo_ml_por_celda[clave] = es_ml
+                elif not es_ml:
+                    solo_ml_por_celda[clave] = False
+                notas_crudas.append((idx, col, texto))
+
+    return [
+        (idx, col, texto, solo_ml_por_celda.get((idx, col), False))
+        for idx, col, texto in notas_crudas
+    ]

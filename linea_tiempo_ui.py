@@ -447,6 +447,9 @@ class LineaTiempoPanel(QWidget):
 
         if not columnas_fecha:
             self.lbl_estado.setText("No se detectó ninguna columna de fecha en este dataset.")
+            self._columna_fecha = None
+            self._fuentes_fecha = {}
+            self.host.rango_tiempo = None
             self._limpiar_plots()
             return
 
@@ -594,7 +597,7 @@ class LineaTiempoPanel(QWidget):
         # filtro por columna, clic en un gráfico) menos el rango de este
         # mismo slider -- así el buscador de filas SÍ se refleja acá.
         df = self.host._construir_df_filtrado_base()
-        if df is None or not self._columna_fecha:
+        if df is None or not self._columna_fecha or self._columna_fecha not in df.columns:
             self._limpiar_plots()
             return
 

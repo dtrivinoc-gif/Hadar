@@ -1995,7 +1995,16 @@ class HadarApp(QMainWindow):
         self.fuentes_datos = datos_proyecto.fuentes_datos
         self.ml_multivariado_activado = datos_proyecto.ml_multivariado_activado
         if hasattr(self, "btn_ml_multivariado"):
+            # blockSignals: evita que restaurar el estado dispare de nuevo el
+            # diálogo de confirmación y el auto-test de _alternar_ml_multivariado
+            # -- acá solo se restaura lo que el proyecto ya tenía guardado.
+            self.btn_ml_multivariado.blockSignals(True)
             self.btn_ml_multivariado.setChecked(self.ml_multivariado_activado)
+            self.btn_ml_multivariado.blockSignals(False)
+            self.btn_ml_multivariado.setText(
+                "Detección por combinación (ML): Activado" if self.ml_multivariado_activado
+                else "Detección por combinación (ML): Desactivado"
+            )
         if self.ml_activado:
             # Foto de los datos tal como llegan al abrir -- útil sobre
             # todo cuando el proyecto se actualizó afuera (ej. una BD que
@@ -2649,7 +2658,7 @@ class HadarApp(QMainWindow):
         self.btn_narrativa_exportar_pdf.clicked.connect(self._narrativa_exportar_pdf)
         controls.addWidget(self.btn_narrativa_exportar_pdf)
 
-        self.btn_ml_multivariado = QPushButton("⚙ Detección por combinación (ML)")
+        self.btn_ml_multivariado = QPushButton("Detección por combinación (ML): Desactivado")
         self.btn_ml_multivariado.setCheckable(True)
         self.btn_ml_multivariado.toggled.connect(self._alternar_ml_multivariado)
         controls.addWidget(self.btn_ml_multivariado)
@@ -2732,7 +2741,8 @@ class HadarApp(QMainWindow):
 
         self.ml_multivariado_activado = activar
         self.btn_ml_multivariado.setText(
-            "✅ Detección por combinación (ML)" if activar else "⚙ Detección por combinación (ML)"
+            "Detección por combinación (ML): Activado" if activar
+            else "Detección por combinación (ML): Desactivado"
         )
         self._marcar_narrativa_desactualizada()
 
@@ -2797,9 +2807,10 @@ class HadarApp(QMainWindow):
         # en el capítulo "Cómo se cruzan tus tablas" del informe.
         self.table_model.limpiar_notas_narrativa()
         notas_celda = anomalias_a_notas_celda(anomalias, df)
-        for row_label, col_name, texto in notas_celda:
+        for row_label, col_name, texto, exclusiva_ml in notas_celda:
             self.table_model.agregar_nota(
-                row_label, col_name, texto, es_anomalia=True, origen_narrativa=True, emitir=False
+                row_label, col_name, texto, es_anomalia=True, origen_narrativa=True,
+                exclusiva_ml=exclusiva_ml, emitir=False,
             )
         if notas_celda:
             self.table_model.layoutChanged.emit()

@@ -11,6 +11,13 @@ from PySide6.QtGui import QColor, QPixmap, QPainter, QBrush
 from .config import COLOR_DANGER, COLOR_ACCENT_3
 from .io_datos import cast_valor_a_dtype
 
+# Rojo oscuro para celdas que SOLO marcó el chequeo de combinación (ML) --
+# ver agregar_nota(exclusiva_ml=...). Si la misma celda también la marcó
+# cualquier otro chequeo, se pinta con el rojo de siempre (COLOR_DANGER):
+# el color distinto es para decir "esto SOLO lo vio el ML", no para decir
+# "esto lo vio el ML también".
+COLOR_ML_EXCLUSIVO = "#8B0000"
+
 
 class PandasTableModel(QAbstractTableModel):
     def __init__(self, df: pd.DataFrame = None):
@@ -26,7 +33,7 @@ class PandasTableModel(QAbstractTableModel):
         # así una nota sigue apuntando a la celda correcta aunque cambien los
         # filtros y esa fila quede en otra posición visual de la tabla.
         self.notas = {}                  # {(row_label, col_name): "texto"}
-        self.anomalias = {}              # subconjunto de notas marcado en rojo
+        self.anomalias = {}              # {clave: exclusiva_ml} -- ver agregar_nota
         self._notas_narrativa_keys = set()  # cuáles vinieron de la pestaña Narrativa
 
         # ===== Limpieza sugerida =====
@@ -40,6 +47,7 @@ class PandasTableModel(QAbstractTableModel):
         # Iconos: se crean una sola vez (no en cada data(), que se llama por
         # cada celda visible en cada repintado).
         self._icono_anomalia = self._crear_icono_punto(COLOR_DANGER)
+        self._icono_anomalia_ml = self._crear_icono_punto(COLOR_ML_EXCLUSIVO)
         self._icono_nota = self._crear_icono_punto(COLOR_ACCENT_3)
 
     @staticmethod
@@ -61,13 +69,20 @@ class PandasTableModel(QAbstractTableModel):
             return None
 
     def agregar_nota(self, row_label, col_name, texto, es_anomalia=False,
-                      origen_narrativa=False, emitir=True):
+                      origen_narrativa=False, exclusiva_ml=False, emitir=True):
         """Agrega o actualiza la nota de una celda, identificada por su
-        etiqueta de índice real y nombre de columna (no por posición)."""
+        etiqueta de índice real y nombre de columna (no por posición).
+        exclusiva_ml=True pinta el círculo en rojo oscuro (COLOR_ML_EXCLUSIVO)
+        en vez del rojo de siempre -- pensado para cuando ESA celda solo la
+        marcó el chequeo de combinación (ML) y ningún otro chequeo la habría
+        marcado por su cuenta. Si la misma celda recibe más de un llamado
+        (varias anomalías tocándola), el último valor de exclusiva_ml es el
+        que queda -- anomalias_a_notas_celda() ya se encarga de que todos
+        los llamados para una misma celda traigan el mismo valor correcto."""
         clave = (row_label, col_name)
         self.notas[clave] = texto
         if es_anomalia:
-            self.anomalias[clave] = True
+            self.anomalias[clave] = exclusiva_ml
         elif clave in self.anomalias:
             del self.anomalias[clave]
         if origen_narrativa:
@@ -183,7 +198,7 @@ class PandasTableModel(QAbstractTableModel):
         if role == Qt.DecorationRole:
             clave = self._clave(row, col)
             if clave in self.anomalias:
-                return self._icono_anomalia
+                return self._icono_anomalia_ml if self.anomalias[clave] else self._icono_anomalia
             if clave in self.notas:
                 return self._icono_nota
             return None

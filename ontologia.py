@@ -397,6 +397,105 @@ def inferir_relaciones(
 
 
 # ----------------------------------------------------------------------
+# Enriquecimiento relacional para el ML multivariado (v1, simple)
+# ----------------------------------------------------------------------
+#
+# Idea (inspirada en cómo Palantir Foundry arma su "Ontología"): antes de
+# correr el Isolation Forest sobre una tabla, se le agregan columnas nuevas
+# que resumen lo que pasa en sus tablas relacionadas 1-a-muchos. Así el
+# modelo puede notar cosas como "un pedido con monto normal pero con una
+# cantidad de líneas rarísima para ese cliente", que es invisible si cada
+# tabla se mira sola.
+#
+# v1 a propósito simple: solo relaciones 1-a-muchos con dirección clara
+# (certeza_direccion distinta de "sin_definir" -- si ni el propio motor de
+# ontología está seguro de quién es el padre, mejor no inventar), y solo
+# columnas NUMÉRICAS de la tabla hija (cantidad, suma, promedio). No toca
+# texto ni fechas todavía.
+
+def enriquecer_tabla_con_relaciones(
+    nombre_tabla_principal: str,
+    tablas: dict,
+    relaciones: list,
+) -> pd.DataFrame:
+    """Devuelve una COPIA de tablas[nombre_tabla_principal] con columnas
+    nuevas resumiendo cada tabla relacionada 1-a-muchos que la tenga a ella
+    como tabla principal. No modifica ninguna tabla original. Si no hay
+    relaciones claras que apliquen, devuelve la tabla tal cual (copia).
+
+    Nombres de columnas nuevas: "{tabla_hija}__cantidad" (cuántas filas de
+    la tabla hija le corresponden a cada fila) y, por cada columna numérica
+    de la tabla hija, "{tabla_hija}__{columna}__suma" y
+    "{tabla_hija}__{columna}__promedio".
+    """
+    df_principal = tablas[nombre_tabla_principal].copy()
+    if df_principal.empty:
+        return df_principal
+
+    # Si dos relaciones distintas apuntan a la MISMA tabla hija (ej.
+    # inferir_relaciones encontró dos columnas candidatas entre las mismas
+    # dos tablas), solo se procesa la primera -- repetir la tabla hija
+    # generaría columnas "__cantidad" duplicadas, y el merge las renombraría
+    # solo (Ventas__cantidad_x / _y) en vez de sobrescribirlas, rompiendo la
+    # línea siguiente que busca el nombre original.
+    tablas_hijas_ya_procesadas = set()
+
+    for rel in relaciones:
+        if rel.certeza_direccion == "sin_definir":
+            continue
+        if rel.tabla_principal != nombre_tabla_principal:
+            continue
+
+        # La tabla "hija" (lado de muchos) es la que NO es la principal.
+        if rel.tabla_origen == nombre_tabla_principal:
+            tabla_hija, columna_hija, columna_principal = (
+                rel.tabla_destino, rel.columna_destino, rel.columna_origen,
+            )
+        elif rel.tabla_destino == nombre_tabla_principal:
+            tabla_hija, columna_hija, columna_principal = (
+                rel.tabla_origen, rel.columna_origen, rel.columna_destino,
+            )
+        else:
+            continue
+
+        if tabla_hija in tablas_hijas_ya_procesadas:
+            continue
+
+        df_hija = tablas.get(tabla_hija)
+        if df_hija is None or df_hija.empty:
+            continue
+        if columna_hija not in df_hija.columns or columna_principal not in df_principal.columns:
+            continue
+        # Si la columna en la tabla hija no se repite, no es 1-a-muchos de
+        # verdad (sería 1-a-1) -- no hay nada útil que resumir.
+        if not df_hija[columna_hija].duplicated().any():
+            continue
+
+        tablas_hijas_ya_procesadas.add(tabla_hija)
+
+        prefijo = tabla_hija
+        conteo = df_hija.groupby(columna_hija).size().rename(f"{prefijo}__cantidad")
+        df_principal = df_principal.merge(
+            conteo, left_on=columna_principal, right_index=True, how="left",
+        )
+        df_principal[f"{prefijo}__cantidad"] = df_principal[f"{prefijo}__cantidad"].fillna(0)
+
+        columnas_numericas = [
+            c for c in df_hija.select_dtypes(include="number").columns
+            if c != columna_hija and not _parece_columna_clave(c)
+        ]
+        for col in columnas_numericas:
+            agregados = df_hija.groupby(columna_hija)[col].agg(["sum", "mean"]).rename(
+                columns={"sum": f"{prefijo}__{col}__suma", "mean": f"{prefijo}__{col}__promedio"}
+            )
+            df_principal = df_principal.merge(
+                agregados, left_on=columna_principal, right_index=True, how="left",
+            )
+
+    return df_principal
+
+
+# ----------------------------------------------------------------------
 # Demo / auto-test rápido con datos de ejemplo (Clientes / Pedidos / Productos)
 # ----------------------------------------------------------------------
 
