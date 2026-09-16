@@ -73,6 +73,24 @@ from .dialogos_limpieza import DialogoRevisarCaracteres
 # real llamado, por ejemplo, "vacío" con una celda efectivamente vacía.
 VALOR_VACIO_FILTRO = "(vacíos)"
 
+# Etiquetas legibles para cada "tipo" de anomalía que devuelve
+# SemanticAnomalyDetector.detect_all() (ver anomalias.py) -- se usan tanto
+# en el combo "Filtrar por anomalía" de la pestaña Datos como en el resumen
+# de anomalías de la pestaña Frecuencias, para no mostrarle al usuario la
+# clave interna en snake_case.
+ETIQUETAS_TIPO_ANOMALIA = {
+    "valores_nulos": "Valores nulos",
+    "duplicados": "Filas duplicadas",
+    "regla_negocio": "Regla de negocio incumplida",
+    "temporal": "Inconsistencia temporal",
+    "quiebre_patron": "Quiebre de patrón (outlier)",
+    "deriva_historica": "Deriva histórica",
+    "patron_multivariado": "Combinación inusual (ML)",
+}
+# Diccionario inverso: etiqueta legible -> clave interna, para traducir de
+# vuelta lo que el usuario elige en el combo.
+_ETIQUETAS_TIPO_ANOMALIA_INVERSA = {v: k for k, v in ETIQUETAS_TIPO_ANOMALIA.items()}
+
 
 class _DialogoElegirHojas(QDialog):
     """
@@ -327,6 +345,12 @@ class HadarApp(QMainWindow):
         self.df = None
         self.filtered_df = None
         self.filtro_grafico = None
+        # Filtro "por anomalía" de la pestaña Datos: None = sin filtro,
+        # "todas" = cualquier anomalía, o la clave interna de un tipo
+        # puntual (ver ETIQUETAS_TIPO_ANOMALIA). Se apoya en
+        # self._ultimas_anomalias, que solo tiene contenido después de
+        # generar el informe en Narrativa -- ver _indices_filtro_anomalia().
+        self.filtro_tipo_anomalia = None
 
         # Ontología liviana (Paso B/C): además de self.df (la tabla activa,
         # que sigue alimentando Gráficos/Métricas/Indicadores/etc. IGUAL que
@@ -1072,6 +1096,7 @@ class HadarApp(QMainWindow):
         self.nombre_tabla_activa = next(iter(nuevas_tablas))
         self.df = nuevas_tablas[self.nombre_tabla_activa]
         self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
         try:
             self.table_model.limpiar_todas_las_notas()
             self._quitar_marcas_limpieza()
@@ -1150,6 +1175,7 @@ class HadarApp(QMainWindow):
         self.df = df
         self._sincronizar_tabla_activa()
         self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
         self.table_model.limpiar_todas_las_notas()
         self._quitar_marcas_limpieza()
         self.fingerprint_actual = self.memoria.registrar_carga(
@@ -1208,6 +1234,7 @@ class HadarApp(QMainWindow):
         self.df = pd.concat([self.df, nueva_df], ignore_index=True)
         self._sincronizar_tabla_activa()
         self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
         self.excel_hojas_activas = self.excel_hojas_activas + [elegida]
         self._actualizar_panel_hojas_excel()
 
@@ -1401,6 +1428,18 @@ class HadarApp(QMainWindow):
         self.datos_values_list.setMaximumHeight(70)
         self.datos_values_list.itemSelectionChanged.connect(self.apply_table_filter)
         top.addWidget(self.datos_values_list, stretch=1)
+
+        top.addWidget(QLabel("Anomalía:"))
+        self.datos_filter_anomalia = QComboBox()
+        self.datos_filter_anomalia.addItem("Sin filtro")
+        self.datos_filter_anomalia.setEnabled(False)
+        self.datos_filter_anomalia.setToolTip(
+            "Filtra la tabla a solo las filas que Narrativa marcó como "
+            "anomalía (opcionalmente de un tipo en particular). Se habilita "
+            "después de presionar \"Generar Narrativa\"."
+        )
+        self.datos_filter_anomalia.currentTextChanged.connect(self._on_datos_filter_anomalia_change)
+        top.addWidget(self.datos_filter_anomalia)
 
         self.btn_editar_datos = QPushButton("Editar Datos: Desactivado")
         self.btn_editar_datos.setCheckable(True)
@@ -1716,6 +1755,7 @@ class HadarApp(QMainWindow):
         self.nombre_tabla_activa = nombre_tabla
         self.df = self.tablas[nombre_tabla]
         self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
         # OJO: las notas de celda (incluidas las automáticas de Narrativa) se
         # limpian al cambiar de tabla, igual que al cargar un archivo nuevo,
         # porque hoy se guardan sin distinguir de qué tabla son. Si esto
@@ -1822,6 +1862,7 @@ class HadarApp(QMainWindow):
         self.nombre_tabla_activa = next(iter(nuevas_tablas))
         self.df = nuevas_tablas[self.nombre_tabla_activa]
         self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
         self.table_model.limpiar_todas_las_notas()
         self._quitar_marcas_limpieza()
         self.excel_path = None
@@ -1877,6 +1918,7 @@ class HadarApp(QMainWindow):
         self.tablas[self.nombre_tabla_activa] = df_nuevo
         self.df = df_nuevo
         self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
         self.refresh_all_column_lists()
         self.apply_table_filter()
         self.lbl_archivo.setText(
@@ -1996,6 +2038,7 @@ class HadarApp(QMainWindow):
         )
         self.df = self.tablas[self.nombre_tabla_activa]
         self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
         self.relaciones_ontologia = datos_proyecto.relaciones_ontologia
         self.ml_activado = datos_proyecto.ml_activado
         self.linea_base_ml = datos_proyecto.linea_base_ml
@@ -2205,6 +2248,71 @@ class HadarApp(QMainWindow):
             self.datos_values_list.selectAll()
         self.apply_table_filter()
 
+    def _on_datos_filter_anomalia_change(self, texto):
+        """El combo 'Anomalía' del filtro de Datos: traduce la etiqueta
+        legible elegida de vuelta a la clave interna que usa
+        self._ultimas_anomalias, y refiltra la tabla."""
+        if not texto or texto == "Sin filtro":
+            self.filtro_tipo_anomalia = None
+        elif texto == "Cualquier anomalía":
+            self.filtro_tipo_anomalia = "todas"
+        else:
+            self.filtro_tipo_anomalia = _ETIQUETAS_TIPO_ANOMALIA_INVERSA.get(texto, texto)
+        self.apply_table_filter()
+
+    def _repoblar_filtro_anomalias(self):
+        """Repuebla el combo 'Anomalía' de Datos con los tipos que
+        aparecen en self._ultimas_anomalias (calculado por Narrativa la
+        última vez que se generó el informe). Sin anomalías detectadas
+        (nunca se generó Narrativa, o el dataset no tiene ninguna), el
+        combo queda deshabilitado en 'Sin filtro' -- igual que estaba
+        antes de que existiera este filtro."""
+        if not hasattr(self, "datos_filter_anomalia"):
+            return
+        tipos_presentes = sorted({
+            a.get("tipo") for a in getattr(self, "_ultimas_anomalias", []) if a.get("tipo")
+        })
+
+        self.datos_filter_anomalia.blockSignals(True)
+        self.datos_filter_anomalia.clear()
+        self.datos_filter_anomalia.addItem("Sin filtro")
+        if tipos_presentes:
+            self.datos_filter_anomalia.addItem("Cualquier anomalía")
+            for tipo in tipos_presentes:
+                self.datos_filter_anomalia.addItem(ETIQUETAS_TIPO_ANOMALIA.get(tipo, tipo))
+        self.datos_filter_anomalia.setEnabled(bool(tipos_presentes))
+        self.datos_filter_anomalia.setCurrentText("Sin filtro")
+        self.datos_filter_anomalia.blockSignals(False)
+        self.filtro_tipo_anomalia = None
+
+    def _indices_filtro_anomalia(self):
+        """Índices reales (los mismos que usa self.df.index) de las filas
+        que cumplen el tipo de anomalía elegido en el filtro de Datos.
+        Se apoya en self._ultimas_anomalias -- si nunca se generó Narrativa,
+        o el tipo elegido ya no aparece, devuelve un conjunto vacío (el
+        filtro simplemente no deja pasar ninguna fila, en vez de fallar)."""
+        tipo = self.filtro_tipo_anomalia
+        indices = set()
+        for a in getattr(self, "_ultimas_anomalias", []):
+            if tipo != "todas" and a.get("tipo") != tipo:
+                continue
+            idxs = a.get("indices_atipicos")
+            if idxs is None:
+                idx_unico = a.get("fila_indice")
+                idxs = [idx_unico] if idx_unico is not None else []
+            indices.update(idxs)
+        return indices
+
+    def _resetear_filtro_anomalias(self):
+        """Se llama junto con 'self.filtro_grafico = None' en cada punto
+        donde se carga un dataset nuevo o se cambia de tabla activa: los
+        índices que guarda self._ultimas_anomalias son de OTRO dataset, así
+        que seguir mostrando ese filtro llevaría a resultados sin sentido
+        (o directamente vacíos). Se limpia en vez de arrastrarlo."""
+        self._ultimas_anomalias = []
+        self._repoblar_filtro_anomalias()
+        self._actualizar_resumen_anomalias_frecuencias()
+
     def _construir_df_filtrado_base(self):
         """DataFrame filtrado por TODO lo de la pestaña Datos (buscador de
         filas puntuales, filtro por columna, filtro por clic en un gráfico)
@@ -2243,6 +2351,10 @@ class HadarApp(QMainWindow):
             val_f = self.filtro_grafico["valor"]
             if col_f in df.columns:
                 df = df[df[col_f].astype(str) == str(val_f)]
+
+        if self.filtro_tipo_anomalia:
+            indices_anomalos = self._indices_filtro_anomalia()
+            df = df[df.index.isin(indices_anomalos)]
 
         return df
 
@@ -2639,6 +2751,22 @@ class HadarApp(QMainWindow):
             cards_row.addWidget(card)
         layout.addLayout(cards_row)
 
+        # Resumen de anomalías (según el último informe generado en
+        # Narrativa) -- independiente de qué columna(s) esté mirando el
+        # usuario más arriba, así que no depende de freq_col_list.
+        cards_row_anomalias = QHBoxLayout()
+        self.card_freq_anomalia_top, self.lbl_freq_anomalia_top = create_stat_card(
+            "Anomalía Más Frecuente"
+        )
+        self.card_freq_anomalia_col, self.lbl_freq_anomalia_col = create_stat_card(
+            "Columna Más Afectada"
+        )
+        for card in (self.card_freq_anomalia_top, self.card_freq_anomalia_col):
+            cards_row_anomalias.addWidget(card)
+        layout.addLayout(cards_row_anomalias)
+        self.lbl_freq_anomalia_top.setText("Genera Narrativa primero")
+        self.lbl_freq_anomalia_col.setText("Genera Narrativa primero")
+
         body = QHBoxLayout()
 
         self.freq_table_model = PandasTableModel()
@@ -2817,6 +2945,12 @@ class HadarApp(QMainWindow):
         self._ultimo_df_narrativa = df
         self._ultimo_nombre_dataset_narrativa = nombre_dataset
         self._narrativa_actualizada = True
+
+        # Habilita/repuebla el filtro "Anomalía" de Datos y el resumen de
+        # anomalías de Frecuencias con lo recién calculado -- ambos leen
+        # self._ultimas_anomalias, no recalculan nada por su cuenta.
+        self._repoblar_filtro_anomalias()
+        self._actualizar_resumen_anomalias_frecuencias()
 
         # Reflejar las anomalías detectadas como notas automáticas en la
         # pestaña Datos (círculo rojo + fondo rosado + tooltip con el motivo).
@@ -3835,9 +3969,54 @@ class HadarApp(QMainWindow):
             f"Reporte exportado a:\n{path}\n({n_hojas} hoja{'s' if n_hojas != 1 else ''})"
         )
 
+    def _actualizar_resumen_anomalias_frecuencias(self):
+        """Cards 'Anomalía Más Frecuente' y 'Columna Más Afectada' de la
+        pestaña Frecuencias. No depende de qué columna(s) esté mirando el
+        usuario en freq_col_list ni del filtro de Datos -- lee directo
+        self._ultimas_anomalias, calculado por Narrativa la última vez que
+        se generó el informe (igual que hace Indicadores con
+        columnas_con_anomalias)."""
+        if not hasattr(self, "lbl_freq_anomalia_top"):
+            return
+
+        anomalias = getattr(self, "_ultimas_anomalias", [])
+        if not anomalias:
+            self.lbl_freq_anomalia_top.setText("Genera Narrativa primero")
+            self.lbl_freq_anomalia_col.setText("Genera Narrativa primero")
+            return
+
+        # Se suma 'filas_afectadas' (no la cantidad de anomalías) para que
+        # un solo tipo con miles de filas pese más que diez anomalías de
+        # una sola fila cada una -- "más frecuente" se refiere a cuántas
+        # filas toca, no a cuántas entradas separadas hay en el informe.
+        filas_por_tipo = {}
+        filas_por_columna = {}
+        for a in anomalias:
+            n = a.get("filas_afectadas") or 0
+            tipo = a.get("tipo")
+            if tipo:
+                filas_por_tipo[tipo] = filas_por_tipo.get(tipo, 0) + n
+            for col in a.get("columnas", []):
+                filas_por_columna[col] = filas_por_columna.get(col, 0) + n
+
+        if filas_por_tipo:
+            tipo_top, n_tipo = max(filas_por_tipo.items(), key=lambda kv: kv[1])
+            etiqueta = ETIQUETAS_TIPO_ANOMALIA.get(tipo_top, tipo_top)
+            self.lbl_freq_anomalia_top.setText(f"{etiqueta} ({n_tipo:,})")
+        else:
+            self.lbl_freq_anomalia_top.setText("-")
+
+        if filas_por_columna:
+            col_top, n_col = max(filas_por_columna.items(), key=lambda kv: kv[1])
+            self.lbl_freq_anomalia_col.setText(f"{col_top} ({n_col:,})")
+        else:
+            self.lbl_freq_anomalia_col.setText("-")
+
     def _update_frecuencias(self):
         if not hasattr(self, "freq_table_model"):
             return
+
+        self._actualizar_resumen_anomalias_frecuencias()
 
         if self.filtered_df is None or self.filtered_df.empty:
             self.freq_table_model.set_dataframe(pd.DataFrame())
