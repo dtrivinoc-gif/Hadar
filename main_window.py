@@ -2792,7 +2792,8 @@ class HadarApp(QMainWindow):
         self.lbl_freq_anomalia_top.setText("Genera Narrativa primero")
         self.lbl_freq_anomalia_col.setText("Genera Narrativa primero")
 
-        body = QHBoxLayout()
+        body_widget = QWidget()
+        body = QHBoxLayout(body_widget)
 
         self.freq_table_model = PandasTableModel()
         self.freq_table_view = QTableView()
@@ -2807,7 +2808,10 @@ class HadarApp(QMainWindow):
         self.freq_plot.setMinimumWidth(320)
         body.addWidget(self.freq_plot, stretch=1)
 
-        layout.addLayout(body, stretch=1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(body_widget)
+        layout.addWidget(scroll, stretch=1)
 
     # ------------------------------------------------------------------
     # TAB NARRATIVA
