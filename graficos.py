@@ -161,37 +161,52 @@ class ChartPanel(QWidget):
         card_layout = QVBoxLayout(self.card)
         outer.addWidget(self.card)
 
-        controls = QHBoxLayout()
-        card_layout.addLayout(controls)
+        controls_top = QHBoxLayout()
+        card_layout.addLayout(controls_top)
+        controls_bottom = QHBoxLayout()
+        card_layout.addLayout(controls_bottom)
 
-        controls.addWidget(QLabel("Nombre:"))
+        controls_top.addWidget(QLabel("Nombre:"))
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Sin título")
         self.name_edit.setMaximumWidth(160)
         self.name_edit.setToolTip(
             "Nombre opcional para identificar este gráfico y usarlo como título en el Reporte."
         )
-        controls.addWidget(self.name_edit)
+        controls_top.addWidget(self.name_edit)
 
-        controls.addWidget(QLabel("Tipo:"))
+        controls_top.addWidget(QLabel("Tipo:"))
         self.combo_type = QComboBox()
         self.combo_type.addItems(CHART_TYPES)
-        controls.addWidget(self.combo_type)
+        controls_top.addWidget(self.combo_type)
+        controls_top.addStretch()
 
         self.lbl_eje_x = QLabel("Eje X:")
-        controls.addWidget(self.lbl_eje_x)
+        controls_bottom.addWidget(self.lbl_eje_x)
         self.combo_x = QComboBox()
-        controls.addWidget(self.combo_x)
+        # Sin esto, el combo se ensancha solo según el nombre de columna más
+        # largo que le carguen (ver update_axis_choices) -- con columnas
+        # reales tipo "fecha_contratacion" eso rompe la fila de controles.
+        # AdjustToMinimumContentsLengthWithIcon + minimumContentsLength fija
+        # un ancho visible razonable; el nombre completo se sigue viendo
+        # completo en el desplegable, solo se trunca en el cuadro cerrado.
+        self.combo_x.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_x.setMinimumContentsLength(14)
+        self.combo_x.setMaximumWidth(180)
+        controls_bottom.addWidget(self.combo_x)
 
         self.lbl_eje_y = QLabel("Eje Y:")
-        controls.addWidget(self.lbl_eje_y)
+        controls_bottom.addWidget(self.lbl_eje_y)
         self.combo_y = QComboBox()
         self.combo_y.addItem("Conteo")
-        controls.addWidget(self.combo_y)
+        self.combo_y.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_y.setMinimumContentsLength(14)
+        self.combo_y.setMaximumWidth(180)
+        controls_bottom.addWidget(self.combo_y)
 
         self.btn_generate = QPushButton("Generar")
         self.btn_generate.setObjectName("accentButton")
-        controls.addWidget(self.btn_generate)
+        controls_bottom.addWidget(self.btn_generate)
 
         self.chk_anotaciones = QCheckBox("Anotaciones")
         self.chk_anotaciones.setChecked(True)
@@ -199,12 +214,13 @@ class ChartPanel(QWidget):
             "Muestra valores directamente sobre el gráfico y una línea de referencia con el promedio."
         )
         self.chk_anotaciones.toggled.connect(lambda: self.render_requested())
-        controls.addWidget(self.chk_anotaciones)
+        controls_bottom.addWidget(self.chk_anotaciones)
+        controls_bottom.addStretch()
 
         self.btn_delete = QPushButton("X")
         self.btn_delete.setObjectName("dangerButton")
         self.btn_delete.setFixedWidth(32)
-        controls.addWidget(self.btn_delete)
+        controls_bottom.addWidget(self.btn_delete)
 
         self.plot_container = QVBoxLayout()
         card_layout.addLayout(self.plot_container)

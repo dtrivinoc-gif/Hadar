@@ -329,7 +329,27 @@ class HadarApp(QMainWindow):
     def __init__(self, modo="nuevo"):
         super().__init__()
         self.setWindowTitle("Hadar Data Analytics Pro")
-        self.resize(1300, 850)
+        ANCHO_DISENO, ALTO_DISENO = 1300, 850
+        pantalla = QApplication.primaryScreen()
+        geo_disponible = pantalla.availableGeometry() if pantalla else None
+        if geo_disponible is not None and (
+            geo_disponible.width() < ANCHO_DISENO or geo_disponible.height() < ALTO_DISENO
+        ):
+            # La ventana se diseñó pensando en 1300x850, pero si la pantalla
+            # es más chica que eso (ej. muchos notebooks vienen en 1280x720),
+            # pedirle ese tamaño obliga a Windows a achicarla por su cuenta
+            # al abrirla -- y el contenido interno, que ya se armó pensando
+            # en el tamaño grande, queda con partes cortadas hasta forzar un
+            # resize real (minimizar/maximizar). Para evitar ese primer
+            # desajuste, en pantallas chicas se abre directamente maximizada:
+            # así el primer tamaño que ve el contenido ya es el definitivo.
+            self.resize(
+                min(ANCHO_DISENO, geo_disponible.width()),
+                min(ALTO_DISENO, geo_disponible.height()),
+            )
+            self.setWindowState(Qt.WindowMaximized)
+        else:
+            self.resize(ANCHO_DISENO, ALTO_DISENO)
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
 
@@ -754,6 +774,43 @@ class HadarApp(QMainWindow):
 
         root_layout.addWidget(self.sidebar)
 
+    def _refrescar_todas_las_pestanas(self):
+        """Fuerza que los PlotWidget de TODAS las pestañas (la visible y las
+        ocultas) recalculen su viewport. Qt no entrega resizeEvent a un
+        widget mientras está oculto -- así que cuando la barra lateral
+        cambia de ancho, la ventana recién se abre, o cambia de tamaño
+        mientras el usuario está en otra pestaña, los gráficos de las
+        pestañas ocultas quedan con su geometría interna desactualizada
+        hasta que algo los "despierta" a mano.
+
+        OJO: redimensionar un widget a su MISMO tamaño (ej. plot.resize(
+        plot.size())) no sirve -- Qt detecta que el tamaño no cambió y ni
+        siquiera dispara el resizeEvent interno, así que no arregla nada.
+        Por eso acá se cambia el ancho en 1px y se vuelve al original: eso
+        sí garantiza dos resizeEvent reales, que es lo que pyqtgraph
+        necesita para recalcular su viewport."""
+        for i in range(self.tabview.count()):
+            widget = self.tabview.widget(i)
+            if widget is None:
+                continue
+            widget.updateGeometry()
+            for plot in widget.findChildren(pg.PlotWidget):
+                tam = plot.size()
+                plot.resize(tam.width() + 1, tam.height())
+                plot.resize(tam)
+                plot.getViewBox().updateAutoRange()
+        QApplication.processEvents()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # El primer acomodo de tamaño real de la ventana (al abrir Hadar,
+        # o al restaurarla desde minimizada) puede dejar los gráficos de
+        # las pestañas que no están activas con el viewport mal calculado
+        # -- se ve igual que el "se corta" reportado, pero sin que el
+        # usuario haya tocado nada todavía. QTimer.singleShot(0, ...) para
+        # que corra apenas la ventana termine de asentar su geometría.
+        QTimer.singleShot(0, self._refrescar_todas_las_pestanas)
+
     def _reposicionar_boton_sidebar(self):
         """Mantiene el botón de plegar pegado al borde derecho de la barra
         (asomándose un poco hacia el área de contenido) y un poco más abajo
@@ -834,6 +891,15 @@ class HadarApp(QMainWindow):
         Al plegar, el contenido se oculta de inmediato (antes de que termine
         de encogerse, para no ver texto apretujado a mitad de camino); al
         desplegar, el contenido reaparece recién cuando termina de crecer."""
+        # Si el usuario hace clic de nuevo mientras la animación anterior
+        # todavía está corriendo (doble clic, clics rápidos), sin este freno
+        # quedaban dos QVariantAnimation compitiendo por el mismo ancho al
+        # mismo tiempo -- el resultado final dependía de cuál terminara al
+        # último, y a veces la barra quedaba a mitad de camino, achicando
+        # el área de las pestañas de forma permanente hasta reiniciar Hadar.
+        if getattr(self, "_animacion_sidebar", None) is not None:
+            self._animacion_sidebar.stop()
+
         expandido_ahora = getattr(self, "_sidebar_expandido", True)
         self._sidebar_expandido = not expandido_ahora
         self.btn_colapsar_sidebar.setText("◀" if self._sidebar_expandido else "▶")
@@ -864,6 +930,7 @@ class HadarApp(QMainWindow):
         animacion.valueChanged.connect(_en_cada_cuadro)
         if self._sidebar_expandido:
             animacion.finished.connect(lambda: self.sidebar_scroll.setVisible(True))
+        animacion.finished.connect(self._refrescar_todas_las_pestanas)
         animacion.start()
         self._animacion_sidebar = animacion  # referencia viva -- si no, Python la destruye a mitad de camino
 
@@ -1357,6 +1424,11 @@ class HadarApp(QMainWindow):
 
         self.tabview = QTabWidget()
         main_layout.addWidget(self.tabview)
+        # Misma lógica que el refresco tras animar la barra lateral: al
+        # cambiar de pestaña, la que recién se muestra puede traer
+        # geometría vieja en sus PlotWidget si algo cambió mientras estaba
+        # oculta (ver _refrescar_todas_las_pestanas).
+        self.tabview.currentChanged.connect(lambda _i: self._refrescar_todas_las_pestanas())
 
         tab_datos = QWidget()
         tab_graficos = QWidget()
@@ -1439,6 +1511,9 @@ class HadarApp(QMainWindow):
         top.addWidget(QLabel("Filtrar por Columna:"))
         self.datos_filter_col = QComboBox()
         self.datos_filter_col.addItem("Sin filtro")
+        self.datos_filter_col.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.datos_filter_col.setMinimumContentsLength(14)
+        self.datos_filter_col.setMaximumWidth(180)
         self.datos_filter_col.currentTextChanged.connect(self._on_datos_filter_col_change)
         top.addWidget(self.datos_filter_col)
 
@@ -1447,23 +1522,35 @@ class HadarApp(QMainWindow):
         self.datos_values_list.setMaximumHeight(70)
         self.datos_values_list.itemSelectionChanged.connect(self.apply_table_filter)
         top.addWidget(self.datos_values_list, stretch=1)
+        layout.addLayout(top)
 
-        top.addWidget(QLabel("Anomalía:"))
+        # Fila aparte para Anomalía + los 3 botones: en la fila de arriba,
+        # el único elemento que se puede achicar es la lista de valores
+        # (datos_values_list) -- si aun achicándola al mínimo no alcanzaba
+        # el espacio, estos botones quedaban recortados contra el borde de
+        # la ventana sin ninguna forma de verlos ni hacer scroll (ver
+        # "Editar Datos" cortado a media palabra). Con su propia fila,
+        # nunca compiten por el mismo espacio.
+        fila_acciones = QHBoxLayout()
+        fila_acciones.addWidget(QLabel("Anomalía:"))
         self.datos_filter_anomalia = QComboBox()
         self.datos_filter_anomalia.addItem("Sin filtro")
         self.datos_filter_anomalia.setEnabled(False)
+        self.datos_filter_anomalia.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.datos_filter_anomalia.setMinimumContentsLength(14)
+        self.datos_filter_anomalia.setMaximumWidth(180)
         self.datos_filter_anomalia.setToolTip(
             "Filtra la tabla a solo las filas que Narrativa marcó como "
             "anomalía (opcionalmente de un tipo en particular). Se habilita "
             "después de presionar \"Generar Narrativa\"."
         )
         self.datos_filter_anomalia.currentTextChanged.connect(self._on_datos_filter_anomalia_change)
-        top.addWidget(self.datos_filter_anomalia)
+        fila_acciones.addWidget(self.datos_filter_anomalia)
 
         self.btn_editar_datos = QPushButton("Editar Datos: Desactivado")
         self.btn_editar_datos.setCheckable(True)
         self.btn_editar_datos.toggled.connect(self._toggle_edicion_datos)
-        top.addWidget(self.btn_editar_datos)
+        fila_acciones.addWidget(self.btn_editar_datos)
 
         self.btn_nota_celda = QPushButton("Agregar Nota")
         self.btn_nota_celda.setToolTip(
@@ -1471,7 +1558,7 @@ class HadarApp(QMainWindow):
             "marca como anomalía también quedan anotadas automáticamente aquí."
         )
         self.btn_nota_celda.clicked.connect(self._abrir_dialogo_nota)
-        top.addWidget(self.btn_nota_celda)
+        fila_acciones.addWidget(self.btn_nota_celda)
 
         self.btn_ver_esquema = QPushButton("Ver esquema")
         self.btn_ver_esquema.setToolTip(
@@ -1481,8 +1568,9 @@ class HadarApp(QMainWindow):
         )
         self.btn_ver_esquema.clicked.connect(self._abrir_ventana_esquema)
         self.btn_ver_esquema.setVisible(False)
-        top.addWidget(self.btn_ver_esquema)
-        layout.addLayout(top)
+        fila_acciones.addWidget(self.btn_ver_esquema)
+        fila_acciones.addStretch()
+        layout.addLayout(fila_acciones)
 
         self.lbl_edicion_hint = QLabel(
             "Doble clic en una celda para editarla, o en el encabezado de una columna para renombrarla. "

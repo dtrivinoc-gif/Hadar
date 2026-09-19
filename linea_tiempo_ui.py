@@ -261,6 +261,12 @@ class LineaTiempoPanel(QWidget):
         self.colors = host.colors
 
         self._columna_fecha = None
+        # Cómo leer una fecha ambigua tipo "03/04/2024": True = día/mes/año
+        # (Chile y la mayoría de países), False = mes/día/año (EE.UU.). Por
+        # defecto Chile, igual que el resto de Hadar (io_datos.py ya asume
+        # esto al escribir celdas a mano) -- el interruptor en la barra de
+        # herramientas deja cambiarlo para datasets que vengan de EE.UU.
+        self._dayfirst = True
         self._columnas_mostrar = set()   # columnas de fecha tildadas en "Fechas a mostrar"
         self._color_por_columna = {}     # {columna: color}, estable mientras no cambien de dataset
         self._marcadores_anomalias = []  # [(scatter_item, anomalia_dict)]
@@ -296,8 +302,28 @@ class LineaTiempoPanel(QWidget):
             "Esta es la columna que usa el slider de rango para recortar "
             "Métricas/Indicadores/Frecuencias/Alarmas."
         )
+        # Sin este límite, el combo se ensancha solo según el nombre de
+        # columna más largo que le carguen -- con columnas reales eso
+        # empujaba "Métricas de tiempo" y "Actualizar" (al final de la
+        # fila, después del addStretch) fuera del borde de la ventana.
+        self.combo_fecha.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_fecha.setMinimumContentsLength(14)
+        self.combo_fecha.setMaximumWidth(180)
         self.combo_fecha.currentTextChanged.connect(self._on_columna_fecha_cambiada)
         toolbar.addWidget(self.combo_fecha)
+
+        toolbar.addWidget(QLabel("Formato:"))
+        self.combo_formato_fecha = QComboBox()
+        self.combo_formato_fecha.addItem("DD/MM/AAAA (Chile)", True)
+        self.combo_formato_fecha.addItem("MM/DD/AAAA (EE.UU.)", False)
+        self.combo_formato_fecha.setToolTip(
+            "Cómo leer una fecha ambigua como 03/04/2024. Chile: 3 de abril. "
+            "EE.UU.: 4 de marzo. Si tus fechas se ven todas amontonadas en "
+            "los primeros 12 días de cada mes, o los meses y días parecen "
+            "invertidos, prueba cambiar esto."
+        )
+        self.combo_formato_fecha.currentIndexChanged.connect(self._on_formato_fecha_cambiado)
+        toolbar.addWidget(self.combo_formato_fecha)
 
         self.btn_columnas_mostrar = QToolButton()
         self.btn_columnas_mostrar.setText("Fechas a mostrar")
@@ -312,7 +338,13 @@ class LineaTiempoPanel(QWidget):
         self.menu_columnas_mostrar = _MenuMultiCheck(self.btn_columnas_mostrar)
         self.btn_columnas_mostrar.setMenu(self.menu_columnas_mostrar)
         toolbar.addWidget(self.btn_columnas_mostrar)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
 
+        # Segunda fila: la primera ya reúne 3 controles más el combo que se
+        # ensancha solo -- separarlas deja margen de sobra en pantallas
+        # angostas, en vez de que todo compita en una sola fila kilométrica.
+        toolbar2 = QHBoxLayout()
         self.btn_conectar = QToolButton()
         self.btn_conectar.setText("Unir fechas")
         self.btn_conectar.setToolTip(
@@ -324,7 +356,7 @@ class LineaTiempoPanel(QWidget):
         self.btn_conectar.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.menu_conectar = _MenuMultiCheck(self.btn_conectar)
         self.btn_conectar.setMenu(self.menu_conectar)
-        toolbar.addWidget(self.btn_conectar)
+        toolbar2.addWidget(self.btn_conectar)
 
         self.btn_conectar_manual = QPushButton("Conectar puntos")
         self.btn_conectar_manual.setCheckable(True)
@@ -334,13 +366,13 @@ class LineaTiempoPanel(QWidget):
             "para salir del modo."
         )
         self.btn_conectar_manual.toggled.connect(self._on_toggle_conectar_manual)
-        toolbar.addWidget(self.btn_conectar_manual)
+        toolbar2.addWidget(self.btn_conectar_manual)
 
-        toolbar.addStretch()
+        toolbar2.addStretch()
 
         self.btn_metricas_tiempo = QPushButton("Métricas de tiempo")
         self.btn_metricas_tiempo.clicked.connect(self._abrir_metricas_tiempo)
-        toolbar.addWidget(self.btn_metricas_tiempo)
+        toolbar2.addWidget(self.btn_metricas_tiempo)
 
         btn_actualizar_vista = QPushButton("Actualizar")
         btn_actualizar_vista.setToolTip(
@@ -348,9 +380,9 @@ class LineaTiempoPanel(QWidget):
             "(normalmente se actualiza sola; este botón es por si acaso)."
         )
         btn_actualizar_vista.clicked.connect(self.refrescar_vista)
-        toolbar.addWidget(btn_actualizar_vista)
+        toolbar2.addWidget(btn_actualizar_vista)
 
-        layout.addLayout(toolbar)
+        layout.addLayout(toolbar2)
 
         self.aviso = QLabel(
             "Arrastra los bordes del área sombreada para recortar un período: "
@@ -601,7 +633,7 @@ class LineaTiempoPanel(QWidget):
             self._limpiar_plots()
             return
 
-        serie_hitos = construir_serie_hitos(df, self._columna_fecha)
+        serie_hitos = construir_serie_hitos(df, self._columna_fecha, dayfirst=self._dayfirst)
         self._dibujar_histograma(serie_hitos)
 
         self.plot_principal.enableAutoRange(axis="xy")
@@ -679,7 +711,7 @@ class LineaTiempoPanel(QWidget):
             df_fuente = df if tabla is None else self.host.tablas.get(tabla)
             if df_fuente is None or columna not in df_fuente.columns:
                 continue
-            serie = construir_serie_hitos(df_fuente, columna)
+            serie = construir_serie_hitos(df_fuente, columna, dayfirst=self._dayfirst)
             if not serie.empty:
                 series_por_clave[clave] = serie
 
@@ -827,7 +859,7 @@ class LineaTiempoPanel(QWidget):
             par = self._pares_disponibles.get(clave)
             if par is None:
                 continue
-            intervalos = construir_intervalos(df, par)
+            intervalos = construir_intervalos(df, par, dayfirst=self._dayfirst)
             color_normal = QColor(self._color_por_par.get(clave, COLOR_ACCENT))
             for indice, fila in intervalos.iterrows():
                 p_ini = self._posicion_punto.get((indice, (None, par.col_inicio)))
@@ -882,7 +914,7 @@ class LineaTiempoPanel(QWidget):
         df_fuente = df if tabla is None else self.host.tablas.get(tabla)
         if df_fuente is None or columna not in df_fuente.columns or indice not in df_fuente.index:
             return None
-        valor = pd.to_datetime(df_fuente.loc[indice, columna], errors="coerce")
+        valor = pd.to_datetime(df_fuente.loc[indice, columna], errors="coerce", dayfirst=self._dayfirst)
         return valor if pd.notna(valor) else None
 
     def _on_toggle_conectar_manual(self, activo):
@@ -936,6 +968,15 @@ class LineaTiempoPanel(QWidget):
         self.host.rango_tiempo = None
         self._redibujar_todo()
 
+    def _on_formato_fecha_cambiado(self, _indice):
+        self._dayfirst = self.combo_formato_fecha.currentData()
+        # Todas las fechas ya dibujadas se leyeron con el formato viejo --
+        # hay que rehacer el rango (los bordes cambian si, por ejemplo, lo
+        # que se leía como "3 de abril" pasa a ser "4 de marzo") y todo el
+        # dibujo, no solo refrescar_vista().
+        self.host.rango_tiempo = None
+        self._redibujar_todo()
+
     # ------------------------------------------------------------------
     # Anomalías: bajo demanda, nunca en cada arrastre del slider
     # ------------------------------------------------------------------
@@ -954,7 +995,7 @@ class LineaTiempoPanel(QWidget):
         if self.host.fingerprint_actual:
             anomalias = self.host.memoria.enriquecer_con_memoria(self.host.fingerprint_actual, anomalias)
 
-        cruces = anomalias_con_fecha(anomalias, df, self._columna_fecha)
+        cruces = anomalias_con_fecha(anomalias, df, self._columna_fecha, dayfirst=self._dayfirst)
         self._marcadores_anomalias = cruces
         if not cruces:
             self._scatter_anomalias.setData([])
@@ -1110,7 +1151,7 @@ class LineaTiempoPanel(QWidget):
             par = self._pares_disponibles.get(clave)
             if par is None:
                 continue
-            intervalos = construir_intervalos(df, par)
+            intervalos = construir_intervalos(df, par, dayfirst=self._dayfirst)
             if intervalos.empty:
                 continue
             resumen = resumen_duraciones(intervalos["duracion"])

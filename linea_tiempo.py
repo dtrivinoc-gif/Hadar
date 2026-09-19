@@ -83,11 +83,19 @@ def sugerir_pares_temporales(columnas_fecha, pares_personalizados=None):
 # Modo Hito
 # ----------------------------------------------------------------------
 
-def construir_serie_hitos(df: pd.DataFrame, columna_fecha: str) -> pd.Series:
+def construir_serie_hitos(df: pd.DataFrame, columna_fecha: str, dayfirst: bool = True) -> pd.Series:
     """Timestamps válidos de una columna de fecha para el Modo Hito,
     conservando el índice original del DataFrame (para poder volver a
-    la fila exacta al hacer clic en un punto)."""
-    fechas = pd.to_datetime(df[columna_fecha], errors="coerce", format="mixed")
+    la fila exacta al hacer clic en un punto).
+
+    dayfirst decide cómo se lee una fecha ambigua tipo "03/04/2024":
+    True = 3 de abril (Chile y la mayoría de países), False = 4 de marzo
+    (Estados Unidos). Nunca se asume un país por defecto en el resto de
+    este archivo -- pero acá SÍ hace falta un default explícito porque
+    pandas, sin instrucciones, interpreta como EE.UU. Se deja en True
+    porque el resto de Hadar (io_datos.cast_valor_a_dtype) ya asume lo
+    mismo; quien cargue datos de EE.UU. cambia el interruptor en la UI."""
+    fechas = pd.to_datetime(df[columna_fecha], errors="coerce", format="mixed", dayfirst=dayfirst)
     return fechas.dropna()
 
 
@@ -113,7 +121,7 @@ def minutos_desde_medianoche(fechas: pd.Series) -> pd.Series:
     return fechas.dt.hour * 60 + fechas.dt.minute + fechas.dt.second / 60
 
 
-def construir_series_hitos_multiples(df: pd.DataFrame, columnas) -> dict:
+def construir_series_hitos_multiples(df: pd.DataFrame, columnas, dayfirst: bool = True) -> dict:
     """Como construir_serie_hitos pero para varias columnas de fecha a la
     vez -- para cuando un dataset tiene más de una fecha relevante (ej.
     fecha_envio/fecha_entrega, fecha_ultima_mantencion/fecha_siguiente)
@@ -124,7 +132,7 @@ def construir_series_hitos_multiples(df: pd.DataFrame, columnas) -> dict:
     for col in columnas:
         if col not in df.columns:
             continue
-        serie = construir_serie_hitos(df, col)
+        serie = construir_serie_hitos(df, col, dayfirst=dayfirst)
         if not serie.empty:
             resultado[col] = serie
     return resultado
@@ -134,12 +142,13 @@ def construir_series_hitos_multiples(df: pd.DataFrame, columnas) -> dict:
 # Pares inicio/fin por fila + incoherencias cronológicas
 # ----------------------------------------------------------------------
 
-def construir_intervalos(df: pd.DataFrame, par: ParTemporal) -> pd.DataFrame:
+def construir_intervalos(df: pd.DataFrame, par: ParTemporal, dayfirst: bool = True) -> pd.DataFrame:
     """DataFrame con inicio, fin, duración y marca de incoherencia (fin
     anterior a inicio) para conectar cada fila con una línea. El índice se conserva
-    para poder ubicar la fila real de cada barra."""
-    inicio = pd.to_datetime(df[par.col_inicio], errors="coerce", format="mixed")
-    fin = pd.to_datetime(df[par.col_fin], errors="coerce", format="mixed")
+    para poder ubicar la fila real de cada barra. Ver construir_serie_hitos
+    para qué decide dayfirst."""
+    inicio = pd.to_datetime(df[par.col_inicio], errors="coerce", format="mixed", dayfirst=dayfirst)
+    fin = pd.to_datetime(df[par.col_fin], errors="coerce", format="mixed", dayfirst=dayfirst)
     validas = inicio.notna() & fin.notna()
     resultado = pd.DataFrame({
         "inicio": inicio[validas],
@@ -204,16 +213,17 @@ def construir_histograma(fechas: pd.Series, objetivo_bins: int = 60):
 # Cruce de anomalías (anomalias.py) con la línea de tiempo
 # ----------------------------------------------------------------------
 
-def anomalias_con_fecha(anomalias: list[dict], df: pd.DataFrame, columna_fecha_referencia: str):
+def anomalias_con_fecha(anomalias: list[dict], df: pd.DataFrame, columna_fecha_referencia: str, dayfirst: bool = True):
     """Cruza cada anomalía detectada con la fecha real de la(s) fila(s)
     donde ocurrió, usando la columna de fecha elegida como referencia
     para la Línea de Tiempo. Una anomalía que afecta muchas filas (ej.
     'quiebre_patron' agrupado) queda anclada en la fecha MEDIANA de sus
     filas afectadas -- el marcador representa el centro real del
-    fenómeno, no el primer o último caso encontrado."""
+    fenómeno, no el primer o último caso encontrado. Ver
+    construir_serie_hitos para qué decide dayfirst."""
     if columna_fecha_referencia not in df.columns:
         return []
-    fechas_df = pd.to_datetime(df[columna_fecha_referencia], errors="coerce", format="mixed")
+    fechas_df = pd.to_datetime(df[columna_fecha_referencia], errors="coerce", format="mixed", dayfirst=dayfirst)
 
     resultado = []
     for a in anomalias:
