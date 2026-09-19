@@ -812,6 +812,23 @@ def build_stylesheet(colors):
         font-weight: 600;
         padding-top: 4px;
     }}
+    QPushButton#sectionHeader {{
+        background-color: transparent;
+        border: none;
+        text-align: left;
+        color: {colors['muted']};
+        font-size: 11px;
+        font-weight: 600;
+        padding: 4px 2px;
+    }}
+    QPushButton#sectionHeader:hover {{
+        background-color: transparent;
+        color: {colors['text']};
+    }}
+    QPushButton#sectionHeader:checked {{
+        background-color: transparent;
+        color: {colors['text']};
+    }}
     QFrame#subPanel {{
         background-color: {colors['bg']};
         border: none;

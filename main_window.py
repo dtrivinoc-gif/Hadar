@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QInputDialog, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QTabBar, QDialog, QApplication, QTextBrowser,
     QDialogButtonBox, QToolButton, QMenu, QFormLayout,
-    QTreeWidget, QTreeWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QSizePolicy,
 )
 from PySide6.QtPrintSupport import QPrinter
 
@@ -477,6 +477,28 @@ class HadarApp(QMainWindow):
         # scroll en vez de apretujar o cortar controles.
         outer_layout = QVBoxLayout(self.sidebar)
         outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # --- Header: logo + título -----------------------------------
+        # A propósito FUERA del QScrollArea de abajo: así queda siempre
+        # arriba y fijo, sin importar cuántas secciones plegables estén
+        # abiertas/cerradas ni cuánto se scrollee el resto. Se oculta junto
+        # con self.sidebar_scroll cuando la barra se colapsa (ver
+        # _toggle_sidebar) porque a 40px de ancho el texto no entra igual.
+        self.sidebar_header = QWidget()
+        header_layout = QHBoxLayout(self.sidebar_header)
+        header_layout.setContentsMargins(20, 20, 20, 10)
+        header_layout.setSpacing(10)
+        if os.path.exists(LOGO_PNG_PATH):
+            lbl_logo = QLabel()
+            pixmap = QPixmap(LOGO_PNG_PATH)
+            lbl_logo.setPixmap(pixmap.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            header_layout.addWidget(lbl_logo)
+        title = QLabel("HADAR ANALYTICS")
+        title.setObjectName("title")
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        outer_layout.addWidget(self.sidebar_header)
 
         self.sidebar_scroll = QScrollArea()
         scroll = self.sidebar_scroll
@@ -503,29 +525,18 @@ class HadarApp(QMainWindow):
         contenido = QWidget()
         scroll.setWidget(contenido)
         sidebar_layout = QVBoxLayout(contenido)
-        sidebar_layout.setContentsMargins(20, 25, 20, 20)
+        sidebar_layout.setContentsMargins(20, 10, 20, 20)
         sidebar_layout.setSpacing(10)
-
-        # --- Header: logo + título ------------------------------------
-        title_box = QHBoxLayout()
-        title_box.setSpacing(10)
-
-        if os.path.exists(LOGO_PNG_PATH):
-            lbl_logo = QLabel()
-            pixmap = QPixmap(LOGO_PNG_PATH)
-            lbl_logo.setPixmap(pixmap.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            title_box.addWidget(lbl_logo)
-
-        title = QLabel("HADAR ANALYTICS")
-        title.setObjectName("title")
-        title_box.addWidget(title)
-        title_box.addStretch()
-
-        sidebar_layout.addLayout(title_box)
-        sidebar_layout.addSpacing(6)
+        # Layout "raíz" de la barra: las secciones plegables (ver
+        # _crear_seccion_plegable) reasignan la variable local
+        # sidebar_layout a su propio contenido mientras se arman, así que
+        # el código de cada sección de más abajo no cambia ni una línea --
+        # solo hay que volver a este layout_raiz al terminar cada sección.
+        sidebar_layout_raiz = sidebar_layout
+        sidebar_layout_raiz.setAlignment(Qt.AlignTop)
 
         # --- Sección: Datos ---------------------------------------------
-        sidebar_layout.addWidget(self._section_label("DATOS"))
+        sidebar_layout = self._crear_seccion_plegable(sidebar_layout_raiz, "DATOS", abierta=True)
 
         btn_load = QPushButton("Cargar Archivo")
         btn_load.setObjectName("accentButton")
@@ -611,10 +622,8 @@ class HadarApp(QMainWindow):
         self.excel_frame.setVisible(False)
         sidebar_layout.addWidget(self.excel_frame)
 
-        sidebar_layout.addWidget(self._divider())
-
         # --- Sección: Herramientas ---------------------------------------
-        sidebar_layout.addWidget(self._section_label("HERRAMIENTAS"))
+        sidebar_layout = self._crear_seccion_plegable(sidebar_layout_raiz, "HERRAMIENTAS", abierta=False)
 
         btn_excel = QPushButton("Calcular nueva columna")
         btn_excel.setObjectName("accentButton")
@@ -682,8 +691,7 @@ class HadarApp(QMainWindow):
         sidebar_layout.addStretch()
 
         # --- Sección: Buscar filas (ancla arriba de Apariencia) -----------
-        sidebar_layout.addWidget(self._divider())
-        sidebar_layout.addWidget(self._section_label("BUSCAR FILAS"))
+        sidebar_layout = self._crear_seccion_plegable(sidebar_layout_raiz, "BUSCAR FILAS", abierta=False)
 
         self.datos_buscar_filas = QLineEdit()
         self.datos_buscar_filas.setPlaceholderText("Ej: 2000, 3000, 27, 8")
@@ -715,8 +723,7 @@ class HadarApp(QMainWindow):
         # esto es solo suciedad técnica (duplicados, espacios de más,
         # formatos inconsistentes). Nunca modifica el dataset: solo señala
         # y deja navegar, la corrección la hace la persona a mano.
-        sidebar_layout.addWidget(self._divider())
-        sidebar_layout.addWidget(self._section_label("LIMPIEZA SUGERIDA"))
+        sidebar_layout = self._crear_seccion_plegable(sidebar_layout_raiz, "LIMPIEZA SUGERIDA", abierta=False)
 
         self.btn_limpieza_sugerida = QPushButton("Buscar suciedad en los datos")
         self.btn_limpieza_sugerida.setToolTip(
@@ -758,21 +765,72 @@ class HadarApp(QMainWindow):
         sidebar_layout.addWidget(self.btn_limpiar_marcas_limpieza)
 
         # --- Sección: Apariencia (anclada abajo) --------------------------
-        sidebar_layout.addWidget(self._divider())
-        sidebar_layout.addWidget(self._section_label("APARIENCIA"))
+        sidebar_layout = self._crear_seccion_plegable(sidebar_layout_raiz, "APARIENCIA", abierta=False)
 
-        self.theme_toggle_btn = QPushButton("Modo Oscuro")
-        self.theme_toggle_btn.setCheckable(True)
-        self.theme_toggle_btn.clicked.connect(self._toggle_theme)
-        sidebar_layout.addWidget(self.theme_toggle_btn)
+        self.botones_tema = {}
+        for clave, etiqueta in (
+            ("light", "Blanco"),
+            ("gray", "Gris Claro"),
+            ("dark", "Azul Oscuro"),
+            ("tactical", "Negro Táctico"),
+        ):
+            btn_tema = QPushButton(etiqueta)
+            btn_tema.setCheckable(True)
+            btn_tema.setChecked(clave == self.theme_name)
+            btn_tema.clicked.connect(lambda _checked, clave=clave: self._seleccionar_tema(clave))
+            sidebar_layout.addWidget(btn_tema)
+            self.botones_tema[clave] = btn_tema
 
+        # "Salir" queda SIEMPRE visible, fuera de cualquier acordeón --
+        # tenerlo escondido detrás de "Apariencia" plegada sería mala idea.
+        # El addStretch() de acá es lo que ancla Salir siempre abajo del
+        # todo y, de paso, mantiene las secciones pegadas arriba (sin él,
+        # con la mayoría de las secciones plegadas, el contenido quedaba
+        # más corto que el alto de la barra y Qt lo repartía raro).
+        sidebar_layout_raiz.addStretch(1)
+        sidebar_layout_raiz.addWidget(self._divider())
         btn_salir = QPushButton("✕  Salir")
         btn_salir.setObjectName("dangerButton")
         btn_salir.setToolTip("Cierra Hadar. Si hay cambios sin guardar, te lo va a preguntar antes.")
         btn_salir.clicked.connect(self.close)
-        sidebar_layout.addWidget(btn_salir)
+        sidebar_layout_raiz.addWidget(btn_salir)
 
         root_layout.addWidget(self.sidebar)
+
+    def _crear_seccion_plegable(self, layout_padre, titulo, abierta=False):
+        """Crea una sección plegable de la barra lateral (ej. "APARIENCIA"):
+        un encabezado en el que se hace clic para mostrar/ocultar su
+        contenido. Devuelve el QVBoxLayout donde va el contenido de la
+        sección -- se agrega ya a layout_padre, así que el código que la
+        llama solo necesita reasignar su variable local `sidebar_layout` a
+        lo que esto devuelve y seguir agregando widgets normalmente."""
+        layout_padre.addWidget(self._divider())
+
+        header = QPushButton(f"▸  {titulo}")
+        header.setObjectName("sectionHeader")
+        header.setCheckable(True)
+        header.setChecked(abierta)
+        header.setCursor(Qt.PointingHandCursor)
+        layout_padre.addWidget(header)
+
+        contenedor = QWidget()
+        contenido_layout = QVBoxLayout(contenedor)
+        contenido_layout.setContentsMargins(4, 6, 0, 6)
+        contenido_layout.setSpacing(8)
+        contenedor.setVisible(abierta)
+        layout_padre.addWidget(contenedor)
+
+        def _alternar(checked, header=header, contenedor=contenedor, titulo=titulo):
+            contenedor.setVisible(checked)
+            header.setText(f"{'▾' if checked else '▸'}  {titulo}")
+
+        header.toggled.connect(_alternar)
+        return contenido_layout
+
+    def _seleccionar_tema(self, theme_name):
+        self.apply_theme(theme_name)
+        for clave, boton in self.botones_tema.items():
+            boton.setChecked(clave == theme_name)
 
     def _refrescar_todas_las_pestanas(self):
         """Fuerza que los PlotWidget de TODAS las pestañas (la visible y las
@@ -914,6 +972,7 @@ class HadarApp(QMainWindow):
 
         if not self._sidebar_expandido:
             self.sidebar_scroll.setVisible(False)
+            self.sidebar_header.setVisible(False)
 
         animacion = QVariantAnimation(self)
         animacion.setStartValue(self.sidebar.width())
@@ -930,6 +989,7 @@ class HadarApp(QMainWindow):
         animacion.valueChanged.connect(_en_cada_cuadro)
         if self._sidebar_expandido:
             animacion.finished.connect(lambda: self.sidebar_scroll.setVisible(True))
+            animacion.finished.connect(lambda: self.sidebar_header.setVisible(True))
         animacion.finished.connect(self._refrescar_todas_las_pestanas)
         animacion.start()
         self._animacion_sidebar = animacion  # referencia viva -- si no, Python la destruye a mitad de camino
@@ -1006,14 +1066,6 @@ class HadarApp(QMainWindow):
         self.refresh_all_column_lists()
         self.apply_table_filter()
         QMessageBox.information(self, "Éxito", f"Columna '{col}' convertida.")
-
-    def _toggle_theme(self):
-        if self.theme_toggle_btn.isChecked():
-            self.apply_theme("light")
-            self.theme_toggle_btn.setText("Modo Claro")
-        else:
-            self.apply_theme("dark")
-            self.theme_toggle_btn.setText("Modo Oscuro")
 
     def apply_theme(self, theme_name):
         self.theme_name = theme_name
@@ -1409,7 +1461,8 @@ class HadarApp(QMainWindow):
         self.filtro_bar.setObjectName("card")
         filtro_layout = QHBoxLayout(self.filtro_bar)
         self.lbl_filtro_activo = QLabel("")
-        filtro_layout.addWidget(self.lbl_filtro_activo)
+        self.lbl_filtro_activo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        filtro_layout.addWidget(self.lbl_filtro_activo, stretch=1)
         filtro_layout.addStretch()
         self.btn_quitar_filtro = QPushButton("Quitar Filtro")
         self.btn_quitar_filtro.clicked.connect(self._quitar_filtro_grafico)
@@ -3522,8 +3575,18 @@ class HadarApp(QMainWindow):
 
         self.lbl_barra_formato = QLabel("Formato de texto: elige un recuadro de texto (doble clic) para activarlo.")
         self.lbl_barra_formato.setObjectName("muted")
-        fila.addWidget(self.lbl_barra_formato)
-        fila.addStretch()
+        # OJO: un QLabel de una sola línea (sin wrap) le pide a su layout,
+        # como mínimo, el ancho completo del texto -- a diferencia de un
+        # QTabBar (las pestañas de arriba, que sí achican/truncan solas),
+        # un QLabel normal NO cede nada por su cuenta. Como esta fila vive
+        # en el mismo QVBoxLayout que "Exportar a PDF" y "+ Hoja" (filas
+        # separadas, pero mismo ancho de página), ese mínimo tan largo
+        # terminaba empujando TODO lo demás de la pestaña Reporte fuera
+        # del ancho disponible. Ignored le dice al layout "no me uses de
+        # referencia para el mínimo": el texto se puede recortar sin que
+        # se lleve por delante los botones de las otras filas.
+        self.lbl_barra_formato.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        fila.addWidget(self.lbl_barra_formato, stretch=1)
 
         fila.addWidget(QLabel("Fuente:"))
         self.combo_fuente_texto = QComboBox()

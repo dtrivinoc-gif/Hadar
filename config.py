@@ -70,6 +70,20 @@ THEMES = {
         "border": "#E2E8F0",
         "muted": "#64748B",
     },
+    "gray": {
+        "bg": "#D4D4D8",        # Gris claro (zinc-300)
+        "card": "#FFFFFF",      # Blanco
+        "text": "#18181B",      # Casi negro, buena legibilidad sobre gris
+        "border": "#A1A1AA",
+        "muted": "#52525B",
+    },
+    "tactical": {
+        "bg": "#000000",        # Negro puro
+        "card": "#27272A",      # Gris oscuro (zinc-800)
+        "text": "#FFFFFF",      # Blanco
+        "border": "#3F3F46",
+        "muted": "#A1A1AA",
+    },
 }
 COLOR_ACCENT = "#6366F1"    # Índigo (accent_1) — acciones principales
 COLOR_ACCENT_2 = "#06B6D4"  # Cian vibrante (accent_2) — acciones secundarias/actualizar
