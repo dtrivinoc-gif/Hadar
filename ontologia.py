@@ -40,6 +40,25 @@ La otra mitad de la solución (agrupar todas las relaciones entre dos
 tablas en UNA sola línea en el diagrama, en vez de una línea por cada
 par de columnas) está en ontologia_ui.py — este archivo no necesita
 saber nada de eso, solo sigue devolviendo la lista de relaciones.
+
+--- Cambios de esta segunda ronda ---
+Con esquemas más grandes (varias tablas de "personas": Empleados,
+Clientes, Jugadores...) seguían apareciendo relaciones falsas de dos
+tipos concretos, ambos corregidos acá:
+
+1. Columnas de nombre genérico que coinciden por casualidad: dos
+   columnas llamadas igual (ej. "tipo", "estado", "activo") en tablas
+   que no tienen ninguna relación real entre sí. Antes, que el nombre
+   fuera idéntico ya alcanzaba la confianza mínima por sí solo, sin
+   necesitar que los VALORES tuvieran nada que ver. Ahora, si el
+   nombre no tiene pinta de ser una llave (id, código, etc.), se exige
+   además un mínimo de solape real de valores (UMBRAL_SOLAPE_MINIMO_
+   NOMBRE_GENERICO).
+2. Columnas de muy pocos valores distintos (booleanas tipo "activo",
+   o con 2-3 categorías): CUALQUIER par de columnas así se va a
+   "solapar" casi 100% entre cualquier par de tablas, sin que eso
+   signifique nada. Ahora se ignoran como evidencia de relación
+   (MINIMO_VALORES_DISTINTOS_PARA_SOLAPE).
 """
 
 from __future__ import annotations
@@ -61,6 +80,14 @@ PESO_TIPO = 0.10                            # cuánto pesa que los tipos calcen
 PESO_VALORES = 0.50                         # cuánto pesa que los valores se solapen
 MAX_FILAS_MUESTRA_VALORES = 5000            # para no comparar sets gigantes
 MAX_RELACIONES_POR_PAR_DE_TABLAS = 3        # evita saturar el diagrama (antes 5)
+MINIMO_VALORES_DISTINTOS_PARA_SOLAPE = 5    # columnas con menos valores distintos que esto
+                                             # (ej. sí/no, activo/inactivo) no cuentan como
+                                             # evidencia: ese tipo de columna "se solapa" casi
+                                             # siempre entre cualquier par de tablas, por azar
+UMBRAL_SOLAPE_MINIMO_NOMBRE_GENERICO = 0.15 # para columnas con nombre genérico (no tipo "id"),
+                                             # no basta con que el nombre coincida (ej. dos
+                                             # columnas "tipo" o "estado" en tablas sin relación
+                                             # real) -- se exige además este mínimo de solape real
 
 
 # ----------------------------------------------------------------------
@@ -164,6 +191,12 @@ def _solape_valores(serie1: pd.Series, serie2: pd.Series) -> float:
     """
     v1, v2 = _muestra_valores(serie1), _muestra_valores(serie2)
     if not v1 or not v2:
+        return 0.0
+    if len(v1) < MINIMO_VALORES_DISTINTOS_PARA_SOLAPE or len(v2) < MINIMO_VALORES_DISTINTOS_PARA_SOLAPE:
+        # Muy pocos valores distintos (ej. una columna booleana "activo",
+        # o "tipo" con 2-3 categorías): el solape va a salir alto entre
+        # CUALQUIER par de tablas sin que eso signifique nada -- se
+        # ignora como evidencia de relación.
         return 0.0
     interseccion = v1 & v2
     mas_chico = min(len(v1), len(v2))
@@ -351,6 +384,15 @@ def inferir_relaciones(
                         continue
 
                     solape = _solape_valores(df1[col1], df2[col2])
+
+                    # Si el nombre no tiene pinta de ser una llave (id, código,
+                    # rut, etc.), que se llamen igual no es prueba suficiente:
+                    # columnas genéricas como "tipo" o "estado" se llaman igual
+                    # todo el tiempo en tablas sin ninguna relación real. Se
+                    # exige, además, algo de solape de valores de verdad.
+                    if not ambas_son_clave and solape < UMBRAL_SOLAPE_MINIMO_NOMBRE_GENERICO:
+                        continue
+
                     confianza = (
                         PESO_NOMBRE * sim_nombre
                         + PESO_TIPO * 1.0

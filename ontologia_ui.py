@@ -53,6 +53,19 @@ grupo (todas las columnas que esa línea resume) de una vez; sería
 más fino poder borrar solo una columna del grupo, pero en la práctica
 casi todos los grupos terminan siendo de 1 sola relación gracias al
 ajuste de umbrales en ontologia.py, así que se dejó así por simpleza.
+
+--- Cambios de esta segunda ronda ---
+1. Líneas ORTOGONALES (solo tramos norte/sur/este/oeste, con un único
+   quiebre en el medio) en vez de líneas rectas en diagonal. Cada caja
+   ahora tiene 4 puntos de anclaje (arriba/abajo/izquierda/derecha) en
+   vez de solo 2, y _LineaRelacion elige automáticamente si conectar
+   por los lados (cuando dos tablas están más separadas en horizontal)
+   o por arriba/abajo (cuando están más separadas en vertical).
+2. La ventana ahora ajusta el zoom automáticamente para que todo el
+   esquema entre en la pantalla al abrirse (antes, con esquemas
+   grandes, quedaba cortado y había que usar la barra de scroll). Hay
+   además un botón "Ajustar vista" para volver a centrar después de
+   mover las cajas a mano.
 """
 
 from __future__ import annotations
@@ -83,6 +96,7 @@ ESPACIO_ENTRE_CAJAS_X_MAX_POR_FILA = 3   # cuántas cajas por fila antes de baja
 ESPACIO_ENTRE_CAJAS_Y = 60
 MAX_COLUMNAS_VISIBLES = 14               # si una tabla tiene más columnas, se recorta la vista (con "+N más")
 DISTANCIA_ETIQUETA_CARDINALIDAD = 16     # qué tan lejos de la caja se dibuja el "1" / "*"
+FACTOR_ZOOM = 1.15                       # cuánto acerca/aleja cada clic en los botones - / +
 
 
 # ----------------------------------------------------------------------
@@ -179,20 +193,30 @@ class _CajaTabla(QGraphicsRectItem):
     def tiene_columna_visible(self, nombre_columna: str) -> bool:
         return nombre_columna in self._filas_columna
 
+    def centro_escena(self) -> QPointF:
+        """Centro de la caja en coordenadas de escena. Se usa para decidir
+        si dos tablas están más separadas en horizontal o en vertical, y
+        así elegir por qué lado sale la línea que las conecta."""
+        return self.mapToScene(QPointF(self.rect().width() / 2, self.rect().height() / 2))
+
     def punto_borde(self, lado: str) -> QPointF:
         """
-        Punto (en coordenadas de ESCENA) en la mitad vertical del borde
-        izquierdo o derecho de la caja. A diferencia de la versión
-        anterior, ya no apunta a una columna específica -- así todas las
-        relaciones entre las mismas dos tablas comparten un único punto
-        de salida/llegada, como en Power BI, en vez de abrirse en
-        abanico desde cada fila.
+        Punto (en coordenadas de ESCENA) en la mitad de uno de los 4
+        bordes de la caja. Ya no apunta a una columna específica -- así
+        todas las relaciones entre las mismas dos tablas comparten un
+        único punto de salida/llegada, como en Power BI, en vez de
+        abrirse en abanico desde cada fila.
 
-        lado: 'izquierda' o 'derecha'.
+        lado: 'izquierda', 'derecha', 'arriba' o 'abajo'.
         """
-        y_local = self.rect().height() / 2
-        x_local = 0 if lado == "izquierda" else self.rect().width()
-        return self.mapToScene(QPointF(x_local, y_local))
+        ancho, alto = self.rect().width(), self.rect().height()
+        puntos_locales = {
+            "izquierda": QPointF(0, alto / 2),
+            "derecha": QPointF(ancho, alto / 2),
+            "arriba": QPointF(ancho / 2, 0),
+            "abajo": QPointF(ancho / 2, alto),
+        }
+        return self.mapToScene(puntos_locales[lado])
 
     def resaltar_columna(self, nombre_columna: str, color: QColor):
         """Dibuja un puntito de color junto a una columna involucrada en
@@ -310,18 +334,43 @@ class _LineaRelacion(QGraphicsPathItem):
     def actualizar_geometria(self):
         r = self._representativa()
 
-        p1 = self.caja_origen.punto_borde("derecha")
-        p2 = self.caja_destino.punto_borde("izquierda")
-        # si la caja destino terminó quedando a la izquierda de la origen,
-        # usamos los bordes contrarios para que la línea no cruce por
-        # ENCIMA de las cajas de forma antiestética
-        if p2.x() < p1.x():
-            p1 = self.caja_origen.punto_borde("izquierda")
-            p2 = self.caja_destino.punto_borde("derecha")
+        # Elige por qué par de lados sale la línea: si las dos tablas
+        # están más separadas en horizontal, sale por izquierda/derecha;
+        # si están más separadas en vertical (ej. una fila de cajas
+        # arriba y otra abajo), sale por arriba/abajo. Así la línea nunca
+        # tiene que cruzar en diagonal por encima de una caja para llegar
+        # a un lado que no le queda de frente.
+        centro_o = self.caja_origen.centro_escena()
+        centro_d = self.caja_destino.centro_escena()
+        dx = centro_d.x() - centro_o.x()
+        dy = centro_d.y() - centro_o.y()
 
-        # Línea recta (antes era una curva Bézier) -- más ordenada y más
-        # parecida a cómo se ven los diagramas de relaciones en Power BI.
+        if abs(dx) >= abs(dy):
+            if dx >= 0:
+                p1 = self.caja_origen.punto_borde("derecha")
+                p2 = self.caja_destino.punto_borde("izquierda")
+            else:
+                p1 = self.caja_origen.punto_borde("izquierda")
+                p2 = self.caja_destino.punto_borde("derecha")
+            medio = (p1.x() + p2.x()) / 2
+            quiebre1 = QPointF(medio, p1.y())
+            quiebre2 = QPointF(medio, p2.y())
+        else:
+            if dy >= 0:
+                p1 = self.caja_origen.punto_borde("abajo")
+                p2 = self.caja_destino.punto_borde("arriba")
+            else:
+                p1 = self.caja_origen.punto_borde("arriba")
+                p2 = self.caja_destino.punto_borde("abajo")
+            medio = (p1.y() + p2.y()) / 2
+            quiebre1 = QPointF(p1.x(), medio)
+            quiebre2 = QPointF(p2.x(), medio)
+
+        # Camino ORTOGONAL: solo tramos norte/sur/este/oeste con un único
+        # quiebre en el medio (antes era una línea recta en diagonal).
         camino = QPainterPath(p1)
+        camino.lineTo(quiebre1)
+        camino.lineTo(quiebre2)
         camino.lineTo(p2)
         self.setPath(camino)
 
@@ -329,6 +378,7 @@ class _LineaRelacion(QGraphicsPathItem):
         grosor = 1.0 + 2.5 * r.confianza
         pen = QPen(color, grosor)
         pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
         if getattr(r, "manual", False):
             pen.setStyle(Qt.DashLine)
         elif getattr(r, "certeza_direccion", "alta") == "sin_definir":
@@ -337,17 +387,22 @@ class _LineaRelacion(QGraphicsPathItem):
 
         # Etiquetas de cardinalidad: solo se dibujan si Hadar (o el
         # usuario) ya sabe cuál tabla es la principal. Si no, se ocultan
-        # y la línea punteada ya avisa que falta confirmarlo.
+        # y la línea punteada ya avisa que falta confirmarlo. El
+        # desplazamiento se hace hacia el primer quiebre (no hacia la
+        # punta lejana), para que la etiqueta quede pegada al primer
+        # tramo -- siempre horizontal o vertical, nunca en diagonal.
         if r.tabla_principal == self.caja_origen.nombre_tabla:
-            punto_uno, punto_muchos = p1, p2
+            punto_uno, vecino_uno = p1, quiebre1
+            punto_muchos, vecino_muchos = p2, quiebre2
         elif r.tabla_principal == self.caja_destino.nombre_tabla:
-            punto_uno, punto_muchos = p2, p1
+            punto_uno, vecino_uno = p2, quiebre2
+            punto_muchos, vecino_muchos = p1, quiebre1
         else:
             punto_uno = punto_muchos = None
 
         if punto_uno is not None:
-            pos_uno = _punto_desplazado(punto_uno, punto_muchos, DISTANCIA_ETIQUETA_CARDINALIDAD)
-            pos_muchos = _punto_desplazado(punto_muchos, punto_uno, DISTANCIA_ETIQUETA_CARDINALIDAD)
+            pos_uno = _punto_desplazado(punto_uno, vecino_uno, DISTANCIA_ETIQUETA_CARDINALIDAD)
+            pos_muchos = _punto_desplazado(punto_muchos, vecino_muchos, DISTANCIA_ETIQUETA_CARDINALIDAD)
             self._etiqueta_uno.setPlainText("1")
             self._etiqueta_uno.setDefaultTextColor(color)
             self._etiqueta_uno.setPos(pos_uno.x() - 5, pos_uno.y() - 10)
@@ -495,6 +550,18 @@ class DialogoEsquemaOntologia(QDialog):
         self.btn_redetectar.clicked.connect(self._redetectar)
         barra.addWidget(self.btn_redetectar)
 
+        self.btn_zoom_menos = QPushButton("-")
+        self.btn_zoom_menos.setFixedWidth(30)
+        self.btn_zoom_menos.setToolTip("Alejar")
+        self.btn_zoom_menos.clicked.connect(lambda: self._zoom(1 / FACTOR_ZOOM))
+        barra.addWidget(self.btn_zoom_menos)
+
+        self.btn_zoom_mas = QPushButton("+")
+        self.btn_zoom_mas.setFixedWidth(30)
+        self.btn_zoom_mas.setToolTip("Acercar")
+        self.btn_zoom_mas.clicked.connect(lambda: self._zoom(FACTOR_ZOOM))
+        barra.addWidget(self.btn_zoom_mas)
+
         barra.addStretch()
         self.lbl_resumen = QLabel("")
         self.lbl_resumen.setStyleSheet(f"color: {colors['muted']}; font-size: 11px;")
@@ -542,6 +609,28 @@ class DialogoEsquemaOntologia(QDialog):
         self._dibujar_relaciones()
         self._actualizar_resumen()
         self.vista.setSceneRect(self.escena.itemsBoundingRect().adjusted(-40, -40, 40, 40))
+
+    def _ajustar_vista(self):
+        """Acerca/aleja el zoom para que todo el esquema quepa en la
+        ventana de una vez, en vez de quedar cortado con barras de
+        scroll (como pasaba con esquemas de varias tablas). Se llama
+        solo automáticamente (al abrir la ventana y al redetectar); el
+        usuario ajusta el zoom a mano con los botones - / +."""
+        rect = self.escena.itemsBoundingRect()
+        if rect.isEmpty():
+            return
+        self.vista.fitInView(rect.adjusted(-30, -30, 30, 30), Qt.KeepAspectRatio)
+
+    def _zoom(self, factor: float):
+        self.vista.scale(factor, factor)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # fitInView necesita que la vista ya tenga un tamaño real en
+        # pantalla -- llamarlo apenas se construye el diálogo (antes de
+        # mostrarse) daría un zoom incorrecto. Por eso se hace acá y no
+        # en _dibujar_todo.
+        self._ajustar_vista()
 
     def _colocar_cajas(self):
         x, y = 0, 0
@@ -684,6 +773,10 @@ class DialogoEsquemaOntologia(QDialog):
 
         self.relaciones = nuevas_auto + manuales
         self._dibujar_todo()
+        # _colocar_cajas() vuelve a poner las tablas en su cuadrícula por
+        # defecto, así que el zoom que el usuario tenía ya no calza --
+        # se reajusta para que todo vuelva a entrar en pantalla.
+        self._ajustar_vista()
 
     def _abrir_dialogo_agregar_relacion(self):
         dialogo = _DialogoAgregarRelacion(self.tablas, self)
