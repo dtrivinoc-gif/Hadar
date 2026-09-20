@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QInputDialog, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QTabBar, QDialog, QApplication, QTextBrowser,
     QDialogButtonBox, QToolButton, QMenu, QFormLayout,
-    QTreeWidget, QTreeWidgetItem, QSizePolicy,
+    QTreeWidget, QTreeWidgetItem, QSizePolicy, QSpinBox,
 )
 from PySide6.QtPrintSupport import QPrinter
 
@@ -3076,6 +3076,18 @@ class HadarApp(QMainWindow):
         self.btn_linaje_buscar = QPushButton("Ver linaje")
         self.btn_linaje_buscar.clicked.connect(self._buscar_linaje)
         buscar_row.addWidget(self.btn_linaje_buscar)
+
+        buscar_row.addWidget(QLabel("Profundidad:"))
+        self.spin_linaje_profundidad = QSpinBox()
+        self.spin_linaje_profundidad.setRange(1, 4)
+        self.spin_linaje_profundidad.setValue(2)
+        self.spin_linaje_profundidad.setToolTip(
+            "Cuántos pasos de relación explorar desde el registro elegido "
+            "(hacia tablas padre e hijas). Un número más alto puede tardar "
+            "más en esquemas grandes."
+        )
+        buscar_row.addWidget(self.spin_linaje_profundidad)
+
         buscar_row.addStretch()
         layout.addLayout(buscar_row)
 
@@ -3092,14 +3104,27 @@ class HadarApp(QMainWindow):
         self.arbol_linaje = QTreeWidget()
         self.arbol_linaje.setHeaderLabels(["Registro conectado"])
         self.arbol_linaje.setColumnCount(1)
+        # Clic derecho en cualquier nodo (no solo la raíz) permite re-anclar
+        # el árbol ahí -- ej. si un nodo salió truncado ("hay más, no se
+        # muestran todas"), esto deja seguir explorando esa rama en
+        # particular en vez de quedar limitado a lo que se veía desde la
+        # búsqueda original.
+        self.arbol_linaje.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.arbol_linaje.customContextMenuRequested.connect(self._menu_contextual_linaje)
         cuerpo.addWidget(self.arbol_linaje, stretch=1)
 
         layout.addLayout(cuerpo, stretch=1)
 
         self._controles_linaje = [
             self.combo_linaje_tabla, self.combo_linaje_columna, self.txt_linaje_valor,
-            self.btn_linaje_buscar, self.lista_linaje_anomalias,
+            self.btn_linaje_buscar, self.lista_linaje_anomalias, self.spin_linaje_profundidad,
         ]
+
+        # Conectado al final, después de crear todos los widgets del
+        # bloque: setValue(2) más arriba ya dispara valueChanged, y en ese
+        # momento self.arbol_linaje todavía no existiría si esto se
+        # conectara antes.
+        self.spin_linaje_profundidad.valueChanged.connect(self._on_linaje_profundidad_change)
 
     def _actualizar_estado_linaje(self):
         """Habilita o deshabilita toda la sub-pestaña Linaje según si hay
@@ -3173,6 +3198,12 @@ class HadarApp(QMainWindow):
         self.txt_linaje_valor.setText(str(valor))
         self._buscar_linaje()
 
+    def _on_linaje_profundidad_change(self, _valor):
+        # Solo re-busca si ya hay algo cargado -- si el usuario todavía no
+        # elige un ID, tocar el spinbox no debe lanzar una búsqueda vacía.
+        if self.txt_linaje_valor.text().strip():
+            self._buscar_linaje()
+
     def _buscar_linaje(self):
         tabla = self.combo_linaje_tabla.currentText()
         columna = self.combo_linaje_columna.currentText()
@@ -3189,6 +3220,7 @@ class HadarApp(QMainWindow):
         raiz = explorar_linaje(
             tabla, valor, columna, self.tablas, relaciones,
             filas_anomalas=self._anomalias_por_tabla,
+            max_saltos=self.spin_linaje_profundidad.value(),
         )
         self.arbol_linaje.clear()
         if raiz is None:
@@ -3217,13 +3249,52 @@ class HadarApp(QMainWindow):
         )
         texto = f"{prefijo}{nodo.tabla} — {nodo.columna_clave} = {nodo.valor_clave}"
         if nodo.truncado:
-            texto += "  (hay más, no se muestran todas)"
+            texto += "  (hay más, no se muestran todas -- clic derecho para explorar desde aquí)"
         item = QTreeWidgetItem([texto])
         if nodo.es_anomalia:
             item.setIcon(0, self.table_model.icono_anomalia())
+        # Guarda tabla/columna/valor del nodo para que el menú contextual
+        # pueda re-anclar el árbol acá, sin tener que recorrer el árbol de
+        # NodoLinaje de nuevo para encontrarlo.
+        item.setData(0, Qt.ItemDataRole.UserRole, (nodo.tabla, nodo.columna_clave, nodo.valor_clave))
         for hijo in nodo.hijos:
             item.addChild(self._construir_item_linaje(hijo))
         return item
+
+    def _menu_contextual_linaje(self, posicion):
+        """Clic derecho sobre un nodo del árbol de Linaje: única opción,
+        re-explorar con ese registro como nueva raíz. La raíz actual
+        también aparece en su propio menú (sin efecto real, pero no hace
+        daño y evita un caso especial para distinguirla)."""
+        item = self.arbol_linaje.itemAt(posicion)
+        if item is None:
+            return
+        datos = item.data(0, Qt.ItemDataRole.UserRole)
+        if not datos:
+            return
+        tabla, columna, valor = datos
+        menu = QMenu(self)
+        accion = menu.addAction(f'Explorar desde aquí ("{tabla}": {columna} = {valor})')
+        elegida = menu.exec(self.arbol_linaje.viewport().mapToGlobal(posicion))
+        if elegida == accion:
+            self._explorar_linaje_desde(tabla, columna, valor)
+
+    def _explorar_linaje_desde(self, tabla, columna, valor):
+        """Re-ancla la búsqueda de Linaje en un registro que apareció como
+        nodo conectado (ver _menu_contextual_linaje), reutilizando los
+        mismos combos/campo de texto que ya usa una búsqueda manual -- así
+        el usuario ve con claridad desde dónde está explorando ahora."""
+        if tabla not in self.tablas:
+            return
+        self.combo_linaje_tabla.blockSignals(True)
+        self.combo_linaje_tabla.setCurrentText(tabla)
+        self.combo_linaje_tabla.blockSignals(False)
+        self._on_linaje_tabla_change(tabla)
+        columnas_disponibles = [self.combo_linaje_columna.itemText(i) for i in range(self.combo_linaje_columna.count())]
+        if columna in columnas_disponibles:
+            self.combo_linaje_columna.setCurrentText(columna)
+        self.txt_linaje_valor.setText(str(valor))
+        self._buscar_linaje()
 
     def _marcar_narrativa_desactualizada(self):
         """Los datos/filtros cambiaron desde la última narrativa generada:
