@@ -6,6 +6,7 @@ por anomalía, el generador del informe tipo libro (NarrativeGenerator) y
 el generador de mapa causal (todavía en una etapa temprana).
 """
 import base64
+import html
 import json
 
 import numpy as np
@@ -17,6 +18,10 @@ from .contagio import calcular_indice_contagio, resumen_en_texto, columna_clave_
 from .correlaciones import detectar_correlaciones_significativas
 from .cooccurrencia import detectar_coocurrencia_de_anomalias, columnas_con_anomalias_suficientes
 from .regimen import detectar_quiebres_de_comportamiento
+from .procedencia import (
+    TIPO_COLUMNA_CALCULADA, evento_de_columna, evento_de_origen, resolver_columnas_base,
+    usa_su_propio_valor_anterior, expresion_a_texto_amigable, fecha_legible, _nombre_de_fuente,
+)
 
 class QuestionAssistant:
     """Sugiere preguntas a partir de lo detectado, sin asumir el dominio del
@@ -520,10 +525,29 @@ _CSS_LIBRO = """
   .resolver-link a { color:#78716c; font-size:11.5px; text-decoration:none; border-bottom:1px dotted #a8a29e; }
   .resolver-link a:hover { color:#4b3b2a; }
   .pendiente { color:#78716c; font-style:italic; }
+  .capitulo h3 { font-size:13px; color:#4b3b2a; margin:14px 0 4px 0; }
+  .origen { margin:8px 0; padding:8px 10px; border-left:3px solid #4b3b2a; background:#faf8f3; }
+  .origen-titulo { font-weight:bold; font-size:13.5px; }
+  .origen-formula { font-family: Consolas, 'Courier New', monospace; font-size:12.5px; margin-top:3px; }
+  .origen-detalle { font-size:12.5px; margin-top:3px; color:#374151; }
   .pregunta { padding:4px 0; }
   ul { padding-left:18px; }
 </style>
 """
+
+
+# Cómo se dice, en lenguaje llano, la operación de un Indicador simple. Se
+# repite acá (en vez de importar indicadores.py) para que narrativa.py siga sin
+# depender de la clase Indicador: solo necesita objetos con los mismos campos.
+_FRASE_OPERACION_INDICADOR = {
+    "suma": "suma de",
+    "promedio": "promedio de",
+    "mediana": "mediana de",
+    "minimo": "valor mínimo de",
+    "maximo": "valor máximo de",
+    "conteo": "cantidad de datos en",
+    "conteo_unico": "cantidad de valores distintos en",
+}
 
 
 class NarrativeGenerator:
@@ -548,7 +572,7 @@ class NarrativeGenerator:
     argumentos, el informe queda exactamente igual que con una sola tabla."""
 
     def __init__(self, df, anomalias, nombre_tabla=None, tablas_relacionadas=None, relaciones=None,
-                 indicadores=None, modo_impresion=False):
+                 indicadores=None, modo_impresion=False, eventos_procedencia=None):
         self.df = df
         self.anomalias = anomalias
         self.nombre_tabla = nombre_tabla
@@ -560,6 +584,10 @@ class NarrativeGenerator:
         # Duck typing a propósito: cualquier objeto con .nombre y
         # .columnas_de_las_que_depende() sirve, sin importar Indicador acá.
         self.indicadores = indicadores or []
+        # Eventos de procedencia (procedencia.py) de la tabla que se está
+        # narrando: hoy, las columnas que Hadar calculó y con qué fórmula.
+        # Alimentan el capítulo "Origen de los datos".
+        self.eventos_procedencia = list(eventos_procedencia or [])
         # True cuando el HTML es para exportar a PDF / imprimir: se omiten
         # los elementos que solo tienen sentido dentro de la app (el enlace
         # "Marcar como resuelta" no sirve de nada en un documento estático,
@@ -571,6 +599,9 @@ class NarrativeGenerator:
         capitulos = []
 
         capitulos.append(self._capitulo_panorama(nombre_dataset, n)); n += 1
+        capitulo_origen = self._capitulo_origen(n)
+        if capitulo_origen:
+            capitulos.append(capitulo_origen); n += 1
         capitulos.append(self._capitulo_anomalias(n)); n += 1
 
         if self.tablas_relacionadas:
@@ -617,6 +648,149 @@ class NarrativeGenerator:
           <h2>Capítulo {n} · El panorama general</h2>
           <p>{nombre_dataset} tiene {n_filas:,} filas y {n_cols} columnas,
              de las cuales {len(num_cols)} son numéricas.{detalle_fecha}{detalle_relacional}</p>
+        </div>"""
+
+    # ------------------------------------------------------------------
+    # Origen de los datos (procedencia.py)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _unir_con_y(items):
+        """['A', 'B', 'C'] -> 'A, B y C' (español natural)."""
+        items = list(items)
+        if len(items) <= 1:
+            return "".join(items)
+        return ", ".join(items[:-1]) + " y " + items[-1]
+
+    @staticmethod
+    def _origen_fuente_html(origen):
+        """Bloque 'De dónde vinieron los datos': archivo (y hoja) o base SQL
+        Server, y cuándo se leyó. Solo se muestra el NOMBRE del archivo, no
+        la ruta completa (el informe se puede exportar y compartir)."""
+        esc = html.escape
+        if origen is None:
+            return (
+                "<h3>De dónde vinieron los datos</h3>"
+                "<p class='pendiente'>No hay registro de dónde vinieron los datos de esta tabla "
+                "(por ejemplo, si el proyecto se guardó antes de que Hadar llevara este registro).</p>"
+            )
+        d = origen.detalle
+        lineas = []
+        fecha = fecha_legible(origen.fecha)
+        primera = fecha_legible(d.get("primera_carga"))
+        if d.get("actualizada") and primera and fecha:
+            lineas.append(f"Se cargó por primera vez el {primera} y se actualizó por última vez el {fecha}.")
+        elif d.get("actualizada") and fecha:
+            lineas.append(f"Se actualizó desde la fuente el {fecha}.")
+        elif fecha:
+            lineas.append(f"Cargado el {fecha}.")
+        else:
+            lineas.append("Fecha de carga: no registrada.")
+        if d.get("filas") is not None and d.get("columnas") is not None:
+            lineas.append(f"Tenía {d['filas']:,} filas y {d['columnas']} columnas cuando se leyó.")
+        lineas.append(
+            "<i>Hadar trabaja con una copia tomada en ese momento: si la fuente cambia "
+            "después, no se entera sola.</i>"
+        )
+        detalle_html = "".join(
+            f"<div class='origen-detalle'>{l if l.startswith('<i>') else esc(l)}</div>" for l in lineas
+        )
+        return (
+            "<h3>De dónde vinieron los datos</h3>"
+            f"<div class='origen'><div class='origen-titulo'>{esc(_nombre_de_fuente(d))}</div>"
+            f"{detalle_html}</div>"
+        )
+
+    def _capitulo_origen(self, n):
+        """Origen de los datos: de dónde sale cada cifra que NO viene tal cual
+        de la carga -- las columnas que Hadar calculó (con su fórmula y las
+        columnas de las que salen, siguiendo la cadena hasta las de partida)
+        y los indicadores del usuario. Todo sale de lo que se anotó al
+        momento de calcular; no se reconstruye ni se supone nada. Devuelve
+        None (sin gastar número de capítulo) si no hay nada que contar."""
+        calculadas = [
+            e for e in self.eventos_procedencia
+            if e.tipo == TIPO_COLUMNA_CALCULADA and e.columna in self.df.columns
+        ]
+        origen = evento_de_origen(self.eventos_procedencia)
+        if origen is None and not calculadas and not self.indicadores:
+            return None
+
+        esc = html.escape
+        partes = [self._origen_fuente_html(origen)]
+
+        if calculadas:
+            bloques = []
+            for e in calculadas:
+                formula = esc(e.detalle.get("formula_texto") or expresion_a_texto_amigable(
+                    e.detalle.get("expresion", "")))
+                usa = [d for d in e.depende_de if d != e.columna]
+                detalle = []
+                if usa:
+                    etiquetas = [
+                        f"{esc(d)} (también calculada)" if evento_de_columna(self.eventos_procedencia, d)
+                        else esc(d)
+                        for d in usa
+                    ]
+                    detalle.append(f"Usa: {self._unir_con_y(etiquetas)}.")
+                elif not usa_su_propio_valor_anterior(e):
+                    detalle.append("No usa ninguna otra columna.")
+                if usa_su_propio_valor_anterior(e):
+                    detalle.append("También usa el valor que tenía antes esta misma columna.")
+                base = resolver_columnas_base(self.eventos_procedencia, e.columna)
+                if base and any(evento_de_columna(self.eventos_procedencia, d) for d in usa):
+                    detalle.append(
+                        f"En último término sale de: {self._unir_con_y([esc(b) for b in base])}."
+                    )
+                fecha = fecha_legible(e.fecha)
+                if fecha:
+                    detalle.append(f"Calculada el {fecha}.")
+                detalle_html = "".join(f"<div class='origen-detalle'>{d}</div>" for d in detalle)
+                bloques.append(
+                    f"<div class='origen'><div class='origen-titulo'>{esc(str(e.columna))}</div>"
+                    f"<div class='origen-formula'>= {formula}</div>{detalle_html}</div>"
+                )
+            partes.append(
+                "<h3>Columnas que Hadar calculó</h3>"
+                "<p class='pendiente'>Se calcularon una sola vez, con los datos que había en ese "
+                "momento. Si después corriges datos de las columnas de las que salen, Hadar no "
+                "las recalcula sola.</p>" + "".join(bloques)
+            )
+
+        if self.indicadores:
+            items = []
+            for ind in self.indicadores:
+                nombre = esc(str(getattr(ind, "nombre", "Indicador")))
+                operacion = getattr(ind, "operacion", None)
+                columna = getattr(ind, "columna", None)
+                formula = getattr(ind, "formula", None)
+                if operacion == "formula":
+                    como = f"fórmula <span style='font-family:Consolas, monospace'>{esc(expresion_a_texto_amigable(formula or ''))}</span>"
+                elif columna:
+                    como = f"{_FRASE_OPERACION_INDICADOR.get(operacion, 'cálculo sobre')} {esc(str(columna))}"
+                else:
+                    como = "cálculo sin columna definida"
+                try:
+                    depende_de = sorted(ind.columnas_de_las_que_depende())
+                except Exception:
+                    depende_de = []
+                extra = ""
+                calculadas_usadas = [
+                    d for d in depende_de if evento_de_columna(self.eventos_procedencia, d)
+                ]
+                if calculadas_usadas:
+                    frases = []
+                    for d in calculadas_usadas:
+                        base = resolver_columnas_base(self.eventos_procedencia, d)
+                        sufijo = f" (sale de {self._unir_con_y([esc(b) for b in base])})" if base else ""
+                        frases.append(f"{esc(d)}{sufijo}")
+                    extra = f" Usa columnas calculadas: {self._unir_con_y(frases)}."
+                items.append(f"<li><b>{nombre}</b>: {como}.{extra}</li>")
+            partes.append("<h3>Tus indicadores</h3><ul>" + "".join(items) + "</ul>")
+
+        return f"""
+        <div class="capitulo">
+          <h2>Capítulo {n} · Origen de los datos</h2>
+          {"".join(partes)}
         </div>"""
 
     def _capitulo_anomalias(self, n):

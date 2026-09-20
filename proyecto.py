@@ -73,7 +73,7 @@ def ruta_carpeta_proyectos():
 def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
                       filtro_columna, filtro_valores, notas_manuales, indicadores,
                       ml_activado=False, linea_base_ml=None, fuentes_datos=None,
-                      ml_multivariado_activado=False):
+                      ml_multivariado_activado=False, procedencia=None):
     """
     ... (ver parámetros existentes arriba)
     fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server", ...}}
@@ -82,6 +82,10 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         contraseña de SQL Server -- esa se pide de nuevo cada vez que se
         actualiza (decisión del usuario, más seguro que guardarla en un
         .hadarproy que es un .zip común, fácil de abrir con 7-Zip).
+    procedencia: lista de dicts (BitacoraProcedencia.a_lista()) con la historia
+        de las columnas -- hoy, cuáles calculó Hadar y con qué fórmula. Los
+        proyectos guardados antes de que existiera simplemente no traen esta
+        clave, y abren igual (con la bitácora vacía).
     """
     metadata = {
         "version": VERSION_FORMATO,
@@ -101,6 +105,7 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         "linea_base_ml": linea_base_ml or {},
         "fuentes_datos": fuentes_datos or {},
         "ml_multivariado_activado": bool(ml_multivariado_activado),
+        "procedencia": procedencia or [],
     }
 
     carpeta = os.path.dirname(ruta)
@@ -122,7 +127,7 @@ class ProyectoCargado:
     def __init__(self, tablas, nombre_tabla_activa, relaciones_ontologia,
                  filtro_columna, filtro_valores, notas_manuales, indicadores_dict,
                  ml_activado=False, linea_base_ml=None, fuentes_datos=None,
-                 ml_multivariado_activado=False):
+                 ml_multivariado_activado=False, procedencia=None):
         self.tablas = tablas
         self.nombre_tabla_activa = nombre_tabla_activa
         self.relaciones_ontologia = relaciones_ontologia
@@ -134,6 +139,7 @@ class ProyectoCargado:
         self.linea_base_ml = linea_base_ml or {}
         self.fuentes_datos = fuentes_datos or {}
         self.ml_multivariado_activado = ml_multivariado_activado
+        self.procedencia = procedencia or []   # lista de dicts -- ver procedencia.BitacoraProcedencia.desde_lista
 
 
 def abrir_proyecto(ruta):
@@ -169,6 +175,7 @@ def abrir_proyecto(ruta):
             linea_base_ml=metadata.get("linea_base_ml", {}),
             fuentes_datos=metadata.get("fuentes_datos", {}),
             ml_multivariado_activado=metadata.get("ml_multivariado_activado", False),
+            procedencia=metadata.get("procedencia", []),
         )
 
 

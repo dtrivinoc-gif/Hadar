@@ -44,6 +44,12 @@ class PandasTableModel(QAbstractTableModel):
         # más, formatos inconsistentes) -- la corrección es casi siempre
         # obvia, pero igual nunca se aplica sola, solo se señala.
         self.limpieza = {}               # {(row_label, col_name): "texto"}
+
+        # ===== Columnas calculadas en Hadar =====
+        # {nombre_columna: "fórmula tal como la escribió el usuario"}. Solo
+        # cambia cómo se ve el ENCABEZADO (marca "ƒx" + tooltip); el nombre
+        # real de la columna en el DataFrame no se toca.
+        self._columnas_calculadas = {}
         # Iconos: se crean una sola vez (no en cada data(), que se llama por
         # cada celda visible en cada repintado).
         self._icono_anomalia = self._crear_icono_punto(COLOR_DANGER)
@@ -186,6 +192,13 @@ class PandasTableModel(QAbstractTableModel):
         idx = self.index(int(row), int(col))
         self.dataChanged.emit(idx, idx, [Qt.DecorationRole, Qt.BackgroundRole, Qt.ToolTipRole])
 
+    def set_columnas_calculadas(self, mapa):
+        """mapa: {nombre_columna: fórmula}. Refresca solo los encabezados."""
+        self._columnas_calculadas = dict(mapa or {})
+        n = self.columnCount()
+        if n:
+            self.headerDataChanged.emit(Qt.Horizontal, 0, n - 1)
+
     def set_dataframe(self, df: pd.DataFrame):
         self.beginResetModel()
         self._df = df
@@ -270,10 +283,27 @@ class PandasTableModel(QAbstractTableModel):
         return True
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal:
+            if section < 0 or section >= len(self._df.columns):
+                return None
+            nombre = str(self._df.columns[section])
+            # EditRole devuelve SIEMPRE el nombre real (sin la marca "ƒx"):
+            # es lo que debe usar cualquier código que necesite el nombre de
+            # la columna (ej. la barra de estado al hacer clic en una celda).
+            if role == Qt.EditRole:
+                return nombre
+            formula = self._columnas_calculadas.get(nombre)
+            if role == Qt.DisplayRole:
+                return f"ƒx {nombre}" if formula is not None else nombre
+            if role == Qt.ToolTipRole and formula is not None:
+                return (
+                    "Columna calculada en Hadar\n"
+                    f"= {formula}\n"
+                    "Se calculó una sola vez: no se actualiza sola si cambias los datos."
+                )
+            return None
         if role != Qt.DisplayRole:
             return None
-        if orientation == Qt.Horizontal:
-            return str(self._df.columns[section])
         # OJO: se usa el índice REAL de la fila (self._df.index), no su
         # posición visual -- si no, en cuanto hay un filtro activo (por
         # columna, por fecha, o el nuevo buscador de filas) la numeración

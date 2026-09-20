@@ -44,6 +44,10 @@ from .indicadores import (
     Indicador, sugerir_indicadores_por_defecto, IndicadorCard, DialogoIndicador,
 )
 from .excel_transform import DialogoTransformacionExcel
+from .procedencia import (
+    BitacoraProcedencia, TIPO_COLUMNA_CALCULADA, TIPO_ARCHIVO_ORIGEN,
+    ORIGEN_ARCHIVO, ORIGEN_SQL_SERVER, evento_de_origen,
+)
 from .report_widgets import (
     ReportBoxItem, REPORTE_PAPEL_BG, REPORTE_PAPEL_BORDE, REPORTE_PAPEL_TINTA,
     REPORTE_COLOR_ROJO, REPORTE_FUENTES, REPORTE_TAMANOS,
@@ -377,6 +381,10 @@ class HadarApp(QMainWindow):
         # -- para poder "Actualizar" sin volver a preguntar todo. Nunca
         # incluye contraseñas (ver _DialogoConexionSqlServer).
         self.fuentes_datos = {}
+        # Historia de las columnas (de dónde salió cada una): hoy, cuáles
+        # calculó Hadar y con qué fórmula. Se guarda dentro del .hadarproy y
+        # alimenta el capítulo "Origen de los datos" de Narrativa. Ver procedencia.py.
+        self.procedencia = BitacoraProcedencia()
 
         self.theme_name = "tactical"
         self.colors = THEMES[self.theme_name]
@@ -913,6 +921,7 @@ class HadarApp(QMainWindow):
             partes.append(f"notas:{sorted(self.table_model.notas_manuales().items(), key=str)}")
         partes.append(f"indicadores:{[ind.to_dict() for ind in self.indicadores]}")
         partes.append(f"relaciones:{self.relaciones_ontologia}")
+        partes.append(f"procedencia:{self.procedencia.a_lista()}")
         texto = "|".join(str(p) for p in partes)
         return hashlib.sha256(texto.encode("utf-8", errors="ignore")).hexdigest()
 
@@ -1183,6 +1192,7 @@ class HadarApp(QMainWindow):
 
         nuevas_tablas = {}      # {nombre_tabla: DataFrame}
         nuevas_fuentes = {}     # {nombre_tabla: {"tipo": "archivo", "ruta": ...}}
+        nuevos_origenes = {}    # {nombre_tabla: datos del archivo/hoja} para la bitácora de procedencia
         info_principal = None   # (path, hojas, hoja_elegida, motor) del 1er archivo cargado OK
         errores = []
 
@@ -1213,6 +1223,7 @@ class HadarApp(QMainWindow):
                     tablas_del_archivo.append({
                         "nombre": nombre_entrada, "df": df_sql,
                         "hojas_libro": None, "hoja": None, "motor": "pandas",
+                        "tabla_sql": nombre_tabla_sql,
                     })
                 if not tablas_del_archivo:
                     continue
@@ -1232,6 +1243,12 @@ class HadarApp(QMainWindow):
                 # esas tablas (sí para csv/xlsx/xls/parquet).
                 if ext != ".sql":
                     nuevas_fuentes[nombre_tabla] = {"tipo": "archivo", "ruta": path}
+                # A diferencia de nuevas_fuentes, el origen se anota también para
+                # un .sql: aunque no se pueda "actualizar", sí se sabe de dónde vino.
+                nuevos_origenes[nombre_tabla] = {
+                    "nombre_archivo": os.path.basename(path), "ruta": path,
+                    "hoja": entrada.get("hoja"), "tabla_sql": entrada.get("tabla_sql"),
+                }
                 if info_principal is None:
                     info_principal = (path, entrada["hojas_libro"], entrada["hoja"], entrada["motor"])
 
@@ -1251,6 +1268,13 @@ class HadarApp(QMainWindow):
         # ningún cambio de comportamiento respecto de antes.
         self.tablas = nuevas_tablas
         self.fuentes_datos = nuevas_fuentes
+        self.procedencia = BitacoraProcedencia()   # datos recién cargados: sin historia previa
+        for nombre_tabla, o in nuevos_origenes.items():
+            self.procedencia.registrar_origen(
+                nombre_tabla, ORIGEN_ARCHIVO,
+                filas=len(nuevas_tablas[nombre_tabla]), columnas=nuevas_tablas[nombre_tabla].shape[1],
+                **o,
+            )
         self.nombre_tabla_activa = next(iter(nuevas_tablas))
         self.df = nuevas_tablas[self.nombre_tabla_activa]
         self.filtro_grafico = None
@@ -1332,6 +1356,12 @@ class HadarApp(QMainWindow):
 
         self.df = df
         self._sincronizar_tabla_activa()
+        self.procedencia.olvidar_tabla(self.nombre_tabla_activa)   # otra hoja: lo anotado de la anterior ya no aplica
+        self.procedencia.registrar_origen(
+            self.nombre_tabla_activa, ORIGEN_ARCHIVO,
+            filas=len(df), columnas=df.shape[1],
+            nombre_archivo=os.path.basename(self.excel_path), ruta=self.excel_path, hoja=nombre_hoja,
+        )
         self.filtro_grafico = None
         self._resetear_filtro_anomalias()
         self.table_model.limpiar_todas_las_notas()
@@ -1391,6 +1421,7 @@ class HadarApp(QMainWindow):
         nueva_df = nueva_df[list(self.df.columns)]
         self.df = pd.concat([self.df, nueva_df], ignore_index=True)
         self._sincronizar_tabla_activa()
+        self.procedencia.registrar_hoja_unida(self.nombre_tabla_activa, elegida, filas=len(self.df))
         self.filtro_grafico = None
         self._resetear_filtro_anomalias()
         self.excel_hojas_activas = self.excel_hojas_activas + [elegida]
@@ -1411,23 +1442,55 @@ class HadarApp(QMainWindow):
             QMessageBox.warning(self, "Sin datos", "Primero carga un archivo de datos.")
             return
 
-        dialogo = DialogoTransformacionExcel(self.df, self)
+        # Para avisar, dentro del diálogo, si se va a reemplazar una columna
+        # de la que otras columnas calculadas salieron.
+        dependientes = {}
+        for col in self.df.columns:
+            usan = self.procedencia.dependientes_de(self.nombre_tabla_activa, col)
+            if usan:
+                dependientes[col] = usan
+
+        dialogo = DialogoTransformacionExcel(self.df, self, dependientes=dependientes)
         if dialogo.exec() == QDialog.DialogCode.Accepted:
             df_resultado, nombre_columna = dialogo.get_resultado()
             if df_resultado is not None and nombre_columna:
                 self.df = df_resultado
                 self._sincronizar_tabla_activa()
+                formula_usada = dialogo.get_formula_usada()
+                if formula_usada:
+                    # Se anota ANTES de refrescar las listas, para que el
+                    # encabezado de la columna nueva ya salga con su marca "ƒx".
+                    self.procedencia.registrar_columna_calculada(
+                        self.nombre_tabla_activa, nombre_columna,
+                        formula_texto=formula_usada[0], expresion=formula_usada[1],
+                    )
                 self.refresh_all_column_lists()
                 self.apply_table_filter()
 
                 QMessageBox.information(
                     self, "Éxito",
-                    f"Columna '{nombre_columna}' creada y aplicada a {len(self.df):,} filas."
+                    f"Columna '{nombre_columna}' creada y aplicada a {len(self.df):,} filas.\n\n"
+                    + (f"Fórmula: {formula_usada[0]}\n\n" if formula_usada else "")
+                    + "Pasa el mouse sobre su encabezado (lleva la marca ƒx) para recordar cómo "
+                    "se calculó. También queda en Narrativa, en «Origen de los datos»."
                 )
+
+    def _actualizar_marcas_columnas_calculadas(self):
+        """Marca con "ƒx" (y tooltip con la fórmula) los encabezados de Datos
+        de las columnas que Hadar calculó en la tabla activa."""
+        if not hasattr(self, "table_model"):
+            return
+        mapa = {}
+        if self.df is not None and self.nombre_tabla_activa is not None:
+            for e in self.procedencia.eventos_de_tabla(self.nombre_tabla_activa, TIPO_COLUMNA_CALCULADA):
+                if e.columna in self.df.columns:
+                    mapa[str(e.columna)] = e.detalle.get("formula_texto", "")
+        self.table_model.set_columnas_calculadas(mapa)
 
     def refresh_all_column_lists(self):
         if self.df is None:
             return
+        self._actualizar_marcas_columnas_calculadas()
         all_cols = self.df.columns.tolist()
         num_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
 
@@ -1899,7 +1962,7 @@ class HadarApp(QMainWindow):
             return
         modelo = index.model()
         valor = modelo.data(index, Qt.DisplayRole)
-        columna = modelo.headerData(index.column(), Qt.Horizontal)
+        columna = modelo.headerData(index.column(), Qt.Horizontal, Qt.EditRole)   # nombre real, sin la marca ƒx
         fila = modelo.headerData(index.row(), Qt.Vertical)
         if valor in (None, ""):
             self.statusBar().clearMessage()
@@ -2039,6 +2102,13 @@ class HadarApp(QMainWindow):
 
         self.tablas = nuevas_tablas
         self.fuentes_datos = nuevas_fuentes
+        self.procedencia = BitacoraProcedencia()   # datos recién cargados: sin historia previa
+        for nombre_tabla, f in nuevas_fuentes.items():
+            self.procedencia.registrar_origen(
+                nombre_tabla, ORIGEN_SQL_SERVER,
+                filas=len(nuevas_tablas[nombre_tabla]), columnas=nuevas_tablas[nombre_tabla].shape[1],
+                servidor=f["servidor"], base_datos=f["base_datos"], tabla_sql=f["tabla"],
+            )
         self.nombre_tabla_activa = next(iter(nuevas_tablas))
         self.df = nuevas_tablas[self.nombre_tabla_activa]
         self.filtro_grafico = None
@@ -2064,6 +2134,29 @@ class HadarApp(QMainWindow):
         self._actualizar_boton_esquema()
         self._actualizar_boton_fuente()
 
+    def _releer_archivo_de_origen(self, ruta):
+        """Vuelve a leer el archivo de la tabla activa y devuelve (DataFrame,
+        [hojas leídas]). Si es un Excel, relee la MISMA hoja (o las mismas hojas
+        unidas) de la que salió la tabla, en vez de la primera hoja del archivo:
+        así 'Actualizar' no trae datos de otra hoja sin avisar."""
+        ext = os.path.splitext(ruta)[1].lower()
+        if ext in (".xlsx", ".xls"):
+            origen = evento_de_origen(self.procedencia.eventos_de_tabla(self.nombre_tabla_activa))
+            hojas = []
+            if origen is not None:
+                if origen.detalle.get("hoja"):
+                    hojas.append(origen.detalle["hoja"])
+                hojas.extend(origen.detalle.get("hojas_unidas") or [])
+            if not hojas:
+                nombres = _excel_sheet_names(ruta)
+                hojas = [nombres[0]] if nombres else []
+            if hojas:
+                partes = [pd.read_excel(ruta, sheet_name=h) for h in hojas]
+                df = partes[0] if len(partes) == 1 else pd.concat(partes, ignore_index=True)
+                return df, hojas
+        df, _motor = load_data(ruta)
+        return df, []
+
     def _actualizar_desde_la_fuente(self):
         """Vuelve a traer los datos de la tabla ACTIVA desde donde vinieron
         -- un archivo (Excel/CSV/Parquet compartido que alguien más pudo
@@ -2072,9 +2165,10 @@ class HadarApp(QMainWindow):
         if info is None:
             return
 
+        hojas_releidas = []
         if info["tipo"] == "archivo":
             try:
-                df_nuevo, _motor = load_data(info["ruta"])
+                df_nuevo, hojas_releidas = self._releer_archivo_de_origen(info["ruta"])
             except Exception as e:
                 QMessageBox.critical(self, "No se pudo actualizar", str(e))
                 return
@@ -2097,6 +2191,28 @@ class HadarApp(QMainWindow):
 
         self.tablas[self.nombre_tabla_activa] = df_nuevo
         self.df = df_nuevo
+        # Se volvió a leer desde la MISMA fuente: se conserva de dónde vino (y cuándo
+        # se cargó por primera vez), pero lo calculado antes ya no aplica.
+        self.procedencia.olvidar_tabla(self.nombre_tabla_activa, conservar=(TIPO_ARCHIVO_ORIGEN,))
+        if not self.procedencia.registrar_actualizacion(
+            self.nombre_tabla_activa, filas=len(df_nuevo), columnas=df_nuevo.shape[1],
+            hoja=hojas_releidas[0] if hojas_releidas else None,
+        ):
+            # Sin origen anotado (ej. proyecto antiguo sin fuente completa): se anota
+            # ahora lo que sí se sabe, sin inventar cuándo fue la primera carga.
+            if info["tipo"] == "archivo":
+                self.procedencia.registrar_origen(
+                    self.nombre_tabla_activa, ORIGEN_ARCHIVO, es_actualizacion=True,
+                    filas=len(df_nuevo), columnas=df_nuevo.shape[1],
+                    nombre_archivo=os.path.basename(info["ruta"]), ruta=info["ruta"],
+                    hoja=hojas_releidas[0] if hojas_releidas else None,
+                )
+            else:
+                self.procedencia.registrar_origen(
+                    self.nombre_tabla_activa, ORIGEN_SQL_SERVER, es_actualizacion=True,
+                    filas=len(df_nuevo), columnas=df_nuevo.shape[1],
+                    servidor=info["servidor"], base_datos=info["base_datos"], tabla_sql=info["tabla"],
+                )
         self.filtro_grafico = None
         self._resetear_filtro_anomalias()
         self.refresh_all_column_lists()
@@ -2167,6 +2283,7 @@ class HadarApp(QMainWindow):
             # no con lo que había la última vez que se abrió el proyecto.
             self.linea_base_ml = actualizar_linea_base(self.linea_base_ml, self.tablas)
 
+        self.procedencia.podar(self.tablas)   # nada de columnas que ya no existen
         try:
             guardar_proyecto(
                 path,
@@ -2181,6 +2298,7 @@ class HadarApp(QMainWindow):
                 linea_base_ml=self.linea_base_ml,
                 fuentes_datos=self.fuentes_datos,
                 ml_multivariado_activado=self.ml_multivariado_activado,
+                procedencia=self.procedencia.a_lista(),
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar el proyecto", str(e))
@@ -2223,6 +2341,10 @@ class HadarApp(QMainWindow):
         self.ml_activado = datos_proyecto.ml_activado
         self.linea_base_ml = datos_proyecto.linea_base_ml
         self.fuentes_datos = datos_proyecto.fuentes_datos
+        self.procedencia = BitacoraProcedencia.desde_lista(datos_proyecto.procedencia)
+        # Proyectos guardados antes de que existiera el registro de origen: se
+        # completa con lo que la fuente guardada sí dice (archivo/base), sin fecha.
+        self.procedencia.completar_origen_desde_fuentes(self.tablas, self.fuentes_datos)
         self.ml_multivariado_activado = datos_proyecto.ml_multivariado_activado
         if hasattr(self, "btn_ml_multivariado"):
             # blockSignals: evita que restaurar el estado dispare de nuevo el
@@ -2382,6 +2504,7 @@ class HadarApp(QMainWindow):
         seleccion_frecuencias = [item.text() for item in self.freq_col_list.selectedItems()]
 
         self.df.rename(columns={nombre_actual: nuevo_nombre}, inplace=True)
+        self.procedencia.renombrar_columna(self.nombre_tabla_activa, nombre_actual, nuevo_nombre)
 
         if self.filtro_grafico and self.filtro_grafico.get("columna") == nombre_actual:
             self.filtro_grafico["columna"] = nuevo_nombre
@@ -3452,12 +3575,15 @@ class HadarApp(QMainWindow):
         modo_impresion=True arma una versión sin los elementos que solo
         tienen sentido dentro de la app (ej. "Marcar como resuelta"),
         pensada para exportar a PDF o imprimir."""
+        self.procedencia.podar(self.tablas)
+        eventos_proc = self.procedencia.eventos_de_tabla(self.nombre_tabla_activa)
         if len(self.tablas) <= 1:
             self._anomalias_por_tabla = {
                 self.nombre_tabla_activa: _todos_los_indices_anomalos(anomalias)
             }
             return NarrativeGenerator(
                 df, anomalias, indicadores=self.indicadores, modo_impresion=modo_impresion,
+                eventos_procedencia=eventos_proc,
             ).generar_html(nombre_dataset)
 
         relaciones = (
@@ -3513,6 +3639,7 @@ class HadarApp(QMainWindow):
             relaciones=relaciones,
             indicadores=self.indicadores,
             modo_impresion=modo_impresion,
+            eventos_procedencia=eventos_proc,
         ).generar_html(nombre_dataset)
 
     def _on_narrativa_anchor_clicked(self, url):

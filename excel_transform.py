@@ -31,11 +31,16 @@ class DialogoTransformacionExcel(QDialog):
     get_resultado() devuelve (df_con_la_columna_nueva, nombre_de_la_columna).
     """
 
-    def __init__(self, df, parent=None):
+    def __init__(self, df, parent=None, dependientes=None):
+        """dependientes: {columna: [columnas calculadas que salieron de ella]}
+        (lo arma HadarApp desde la bitácora de procedencia). Solo se usa para
+        avisar al reemplazar una columna de la que otras dependen."""
         super().__init__(parent)
         self.df = df
         self.df_resultado = None
         self.nombre_columna = None
+        self.dependientes = dependientes or {}
+        self.formula_usada = None   # (texto escrito por el usuario, expresión interna)
 
         self.setWindowTitle("Excel: Calcular y Arrastrar")
         self.setMinimumWidth(540)
@@ -187,9 +192,19 @@ class DialogoTransformacionExcel(QDialog):
             return
 
         if nombre in self.df.columns:
+            aviso_dependientes = ""
+            usan_esta = self.dependientes.get(nombre) or []
+            if usan_esta:
+                lista = ", ".join(f"'{c}'" for c in usan_esta)
+                aviso_dependientes = (
+                    f"\n\nOjo: estas columnas calculadas salieron de '{nombre}': {lista}. "
+                    f"Sus valores no se recalculan solos, así que podrían quedar "
+                    f"desactualizados."
+                )
             respuesta = QMessageBox.question(
                 self, "Columna existente",
-                f"Ya existe una columna llamada '{nombre}'. ¿Quieres reemplazarla?",
+                f"Ya existe una columna llamada '{nombre}'. ¿Quieres reemplazarla?"
+                f"{aviso_dependientes}",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if respuesta != QMessageBox.StandardButton.Yes:
@@ -199,10 +214,18 @@ class DialogoTransformacionExcel(QDialog):
         df_resultado[nombre] = resultado
         self.df_resultado = df_resultado
         self.nombre_columna = nombre
+        texto_formula = self.formula_edit.text().strip()
+        self.formula_usada = (texto_formula, self._traducir_formula(texto_formula))
         self.accept()
 
     def get_resultado(self):
         return self.df_resultado, self.nombre_columna
+
+    def get_formula_usada(self):
+        """(texto que escribió el usuario, expresión interna) de la columna
+        recién creada -- para la bitácora de procedencia. None si el diálogo
+        no se aceptó."""
+        return self.formula_usada
 
 
 # ----------------------------------------------------------------------------
