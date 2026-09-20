@@ -378,7 +378,7 @@ class HadarApp(QMainWindow):
         # incluye contraseñas (ver _DialogoConexionSqlServer).
         self.fuentes_datos = {}
 
-        self.theme_name = "dark"
+        self.theme_name = "tactical"
         self.colors = THEMES[self.theme_name]
 
         self.df = None
@@ -490,16 +490,16 @@ class HadarApp(QMainWindow):
         header_layout.setContentsMargins(20, 20, 20, 10)
         header_layout.setSpacing(10)
         if os.path.exists(LOGO_PNG_PATH):
-            lbl_logo = QLabel()
-            pixmap = QPixmap(LOGO_PNG_PATH)
-            lbl_logo.setPixmap(pixmap.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            header_layout.addWidget(lbl_logo)
-        title = QLabel("HADAR ANALYTICS")
-        title.setObjectName("title")
-        header_layout.addWidget(title)
+            self.lbl_logo_header = QLabel()
+            header_layout.addWidget(self.lbl_logo_header)
+            self._actualizar_logo_tema()
+        else:
+            # Si falta el archivo del logo, se muestra el texto de siempre
+            title = QLabel("HADAR ANALYTICS")
+            title.setObjectName("title")
+            header_layout.addWidget(title)
         header_layout.addStretch()
         outer_layout.addWidget(self.sidebar_header)
-
         self.sidebar_scroll = QScrollArea()
         scroll = self.sidebar_scroll
         scroll.setWidgetResizable(True)
@@ -1067,9 +1067,29 @@ class HadarApp(QMainWindow):
         self.apply_table_filter()
         QMessageBox.information(self, "Éxito", f"Columna '{col}' convertida.")
 
+    def _actualizar_logo_tema(self):
+        """El logo es blanco sobre fondo transparente; aquí se pinta del
+        color de texto del tema activo (blanco en Azul/Negro, casi negro
+        en Blanco/Gris) para que siempre se vea."""
+        if not hasattr(self, "lbl_logo_header"):
+            return
+        dpr = self.devicePixelRatioF()
+        pix = QPixmap(LOGO_PNG_PATH).scaledToWidth(
+            int(240 * dpr), Qt.TransformationMode.SmoothTransformation)
+        tinte = QPixmap(pix.size())
+        tinte.fill(Qt.GlobalColor.transparent)
+        p = QPainter(tinte)
+        p.drawPixmap(0, 0, pix)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        p.fillRect(tinte.rect(), QColor(self.colors["text"]))
+        p.end()
+        tinte.setDevicePixelRatio(dpr)
+        self.lbl_logo_header.setPixmap(tinte)
+
     def apply_theme(self, theme_name):
         self.theme_name = theme_name
         self.colors = THEMES[theme_name]
+        self._actualizar_logo_tema()
         QApplication.instance().setStyleSheet(build_stylesheet(self.colors))
         for panel in self.chart_panels:
             panel.apply_theme(self.colors)

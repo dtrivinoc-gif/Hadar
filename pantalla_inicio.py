@@ -148,7 +148,7 @@ class PantallaInicio(QDialog):
         super().__init__(parent)
         self.modo = None
         self.ruta_proyecto = None
-        self.colors = THEMES["dark"]
+        self.colors = THEMES["tactical"]
 
         self.setWindowTitle("Hadar Data Analytics")
         self.setMinimumSize(560, 560)
@@ -165,16 +165,20 @@ class PantallaInicio(QDialog):
         encabezado = QHBoxLayout()
         if os.path.exists(LOGO_PNG_PATH):
             lbl_logo = QLabel()
-            pixmap = QPixmap(LOGO_PNG_PATH)
-            lbl_logo.setPixmap(pixmap.scaled(36, 36, Qt.AspectRatioMode.KeepAspectRatio,
-                                              Qt.TransformationMode.SmoothTransformation))
+            dpr = self.devicePixelRatioF()
+            pixmap = QPixmap(LOGO_PNG_PATH).scaledToWidth(
+                int(280 * dpr), Qt.TransformationMode.SmoothTransformation)
+            pixmap.setDevicePixelRatio(dpr)
+            lbl_logo.setPixmap(pixmap)
             encabezado.addWidget(lbl_logo)
-        titulo = QLabel("HADAR ANALYTICS")
-        fuente_titulo = QFont()
-        fuente_titulo.setBold(True)
-        fuente_titulo.setPointSize(16)
-        titulo.setFont(fuente_titulo)
-        encabezado.addWidget(titulo)
+        else:
+            # Si falta el archivo del logo, se muestra el texto de siempre
+            titulo = QLabel("HADAR ANALYTICS")
+            fuente_titulo = QFont()
+            fuente_titulo.setBold(True)
+            fuente_titulo.setPointSize(16)
+            titulo.setFont(fuente_titulo)
+            encabezado.addWidget(titulo)
         encabezado.addStretch()
         layout_general.addLayout(encabezado)
 
