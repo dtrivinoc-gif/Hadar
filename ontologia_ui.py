@@ -3,25 +3,61 @@ ontologia_ui.py — Ventana del "Esquema sugerido" (diagrama de tablas y
 relaciones) para Hadar.
 
 Qué es esto, en simple:
-  El usuario carga 2+ tablas (ej. Clientes y Pedidos). Esta ventana le
-  muestra una cajita por tabla, con sus columnas adentro, y líneas que
-  conectan las columnas que Hadar cree que están relacionadas (calculado
-  por ontologia.inferir_relaciones). El usuario puede:
-    - arrastrar las cajitas para acomodarlas a su gusto,
-    - borrar una línea que esté mal (clic derecho -> Eliminar),
-    - agregar una relación a mano si Hadar no la encontró sola.
+El usuario carga 2+ tablas (ej. Clientes y Pedidos). Esta ventana le
+muestra una cajita por tabla, con sus columnas adentro, y líneas que
+conectan las tablas que Hadar cree que están relacionadas (calculado
+por ontologia.inferir_relaciones). El usuario puede:
+- arrastrar las cajitas para acomodarlas a su gusto,
+- borrar una línea que esté mal (clic derecho -> Eliminar),
+- agregar una relación a mano si Hadar no la encontró sola.
 
-  Nada de esto obliga al usuario a saber de bases de datos: si no toca
-  nada, el esquema sugerido automático ya queda funcionando.
+Nada de esto obliga al usuario a saber de bases de datos: si no toca
+nada, el esquema sugerido automático ya queda funcionando.
 
 Este módulo no toca el DataFrame activo de la app (self.df en
 HadarApp) ni ninguna otra pestaña — es autocontenido. La ventana
 principal solo necesita: crear el diálogo pasándole las tablas y el
 tema de colores, mostrarlo, y (más adelante, en el Paso C) leer
 `dialogo.relaciones` para cruzar información en Narrativa.
+
+--- Cambios de esta versión ---
+El diagrama se veía "desprolijo" con muchas curvas cruzándose. Tres
+cambios, inspirados en cómo Power BI dibuja sus relaciones:
+
+1. Líneas RECTAS en vez de curvas (antes: cubicTo / Bézier).
+
+2. UNA sola línea por CADA PAR DE TABLAS, en vez de una línea por
+   cada par de columnas que calzó. Si Hadar encontró, por ejemplo,
+   2 columnas en común entre "Inventario" y "Productos", antes se
+   dibujaban 2 curvas separadas; ahora se dibuja 1 sola línea recta
+   entre esas dos cajas, y el detalle de qué columnas coinciden queda
+   en el tooltip (al pasar el mouse) y en los puntitos de color junto
+   a cada columna involucrada (eso no cambió). Con esto, el número de
+   líneas en el diagrama pasa de "una por columna que calzó" a "una
+   por par de tablas relacionadas", que es exactamente como se ve un
+   diagrama de Power BI.
+
+3. Etiquetas de cardinalidad "1" / "*" en las puntas de cada línea
+   (el "algo en medio" que se ve en los diagramas de Power BI): el
+   extremo "1" señala la tabla principal (la lista maestra, ej.
+   Productos) y el extremo "*" señala la tabla que la referencia
+   muchas veces (ej. Inventario). Si Hadar no está seguro de cuál es
+   cuál, no se dibuja ninguna etiqueta y la línea queda punteada,
+   igual que antes, invitando a que el usuario lo confirme con clic
+   derecho.
+
+La clase _LineaRelacion ahora representa un GRUPO de una o más
+relaciones (ontologia.RelacionSugerida) entre las mismas dos tablas,
+en vez de una sola. El clic derecho para eliminar borra todo el
+grupo (todas las columnas que esa línea resume) de una vez; sería
+más fino poder borrar solo una columna del grupo, pero en la práctica
+casi todos los grupos terminan siendo de 1 sola relación gracias al
+ajuste de umbrales en ontologia.py, así que se dejó así por simpleza.
 """
 
 from __future__ import annotations
+
+import math
 
 from PySide6.QtCore import Qt, QPointF, QRectF
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QPixmap
@@ -35,17 +71,18 @@ from PySide6.QtWidgets import (
 from .config import COLOR_ACCENT, COLOR_ACCENT_2, COLOR_ACCENT_3, COLOR_DANGER
 from .ontologia import inferir_relaciones, RelacionSugerida
 
-
 # ----------------------------------------------------------------------
 # Medidas del diagrama (en píxeles de la escena)
 # ----------------------------------------------------------------------
+
 ANCHO_CAJA = 220
 ALTO_FILA_COLUMNA = 26
 ALTO_TITULO = 40
 ESPACIO_ENTRE_CAJAS_X = 90
 ESPACIO_ENTRE_CAJAS_X_MAX_POR_FILA = 3   # cuántas cajas por fila antes de bajar
 ESPACIO_ENTRE_CAJAS_Y = 60
-MAX_COLUMNAS_VISIBLES = 14  # si una tabla tiene más columnas, se recorta la vista (con "+N más")
+MAX_COLUMNAS_VISIBLES = 14               # si una tabla tiene más columnas, se recorta la vista (con "+N más")
+DISTANCIA_ETIQUETA_CARDINALIDAD = 16     # qué tan lejos de la caja se dibuja el "1" / "*"
 
 
 # ----------------------------------------------------------------------
@@ -121,7 +158,6 @@ class _CajaTabla(QGraphicsRectItem):
             texto.setDefaultTextColor(QColor(colors["text"]))
             texto.setPos(18, y)
             # recorta nombres muy largos para que no se salgan de la caja
-            metrica = texto.font()
             if texto.boundingRect().width() > ANCHO_CAJA - 30:
                 texto.setPlainText(str(col)[:22] + "…")
             self._filas_columna[col] = QRectF(0, y, ANCHO_CAJA, ALTO_FILA_COLUMNA)
@@ -143,24 +179,25 @@ class _CajaTabla(QGraphicsRectItem):
     def tiene_columna_visible(self, nombre_columna: str) -> bool:
         return nombre_columna in self._filas_columna
 
-    def punto_ancla(self, nombre_columna: str, lado: str) -> QPointF:
+    def punto_borde(self, lado: str) -> QPointF:
         """
-        Punto (en coordenadas de ESCENA) donde debe llegar/salir una línea
-        para esta columna. Si la columna no está entre las visibles (tabla
-        con muchas columnas, recortada), ancla al título de la caja.
+        Punto (en coordenadas de ESCENA) en la mitad vertical del borde
+        izquierdo o derecho de la caja. A diferencia de la versión
+        anterior, ya no apunta a una columna específica -- así todas las
+        relaciones entre las mismas dos tablas comparten un único punto
+        de salida/llegada, como en Power BI, en vez de abrirse en
+        abanico desde cada fila.
+
         lado: 'izquierda' o 'derecha'.
         """
-        fila = self._filas_columna.get(nombre_columna)
-        if fila is None:
-            y_local = ALTO_TITULO / 2
-        else:
-            y_local = fila.top() + fila.height() / 2
-        x_local = 0 if lado == "izquierda" else ANCHO_CAJA
+        y_local = self.rect().height() / 2
+        x_local = 0 if lado == "izquierda" else self.rect().width()
         return self.mapToScene(QPointF(x_local, y_local))
 
     def resaltar_columna(self, nombre_columna: str, color: QColor):
         """Dibuja un puntito de color junto a una columna involucrada en
-        una relación (pista visual rápida, sin tener que seguir la línea)."""
+        una relación (pista visual rápida de qué columnas calzaron, sin
+        tener que abrir el tooltip de la línea)."""
         fila = self._filas_columna.get(nombre_columna)
         if fila is None:
             return
@@ -186,23 +223,40 @@ class _CajaTabla(QGraphicsRectItem):
         super().mouseReleaseEvent(event)
 
 
+def _punto_desplazado(origen: QPointF, hacia: QPointF, distancia: float) -> QPointF:
+    """Punto ubicado a `distancia` píxeles de `origen`, en línea recta
+    hacia `hacia`. Se usa para poner las etiquetas "1" / "*" un poco
+    separadas de la caja, no pegadas al borde."""
+    dx = hacia.x() - origen.x()
+    dy = hacia.y() - origen.y()
+    largo = math.hypot(dx, dy) or 1.0
+    return QPointF(origen.x() + dx / largo * distancia, origen.y() + dy / largo * distancia)
+
+
 # ----------------------------------------------------------------------
-# Línea que conecta dos columnas
+# Línea que conecta dos tablas (puede resumir más de una relación/columna)
 # ----------------------------------------------------------------------
 
 class _LineaRelacion(QGraphicsPathItem):
-    """Curva entre la columna de una tabla y la de otra. Se puede eliminar
-    con clic derecho. El grosor/color reflejan la confianza."""
+    """Línea recta entre dos tablas. Representa UNA O MÁS relaciones
+    (ontologia.RelacionSugerida) entre las mismas dos tablas -- si Hadar
+    encontró varias columnas en común entre "A" y "B", todas comparten
+    esta misma línea en vez de dibujarse por separado.
 
-    def __init__(self, relacion: RelacionSugerida, caja_origen: _CajaTabla,
+    Se puede eliminar con clic derecho (borra TODAS las relaciones que
+    resume). El grosor/color reflejan la confianza de la relación más
+    fuerte del grupo."""
+
+    def __init__(self, relaciones: list[RelacionSugerida], caja_origen: _CajaTabla,
                  caja_destino: _CajaTabla, colors: dict, on_eliminar, on_confirmar_direccion=None):
         super().__init__()
-        self.relacion = relacion
+        self.relaciones = relaciones
         self.caja_origen = caja_origen
         self.caja_destino = caja_destino
         self.colors = colors
         self._on_eliminar = on_eliminar
         self._on_confirmar_direccion = on_confirmar_direccion
+        self._tooltip_texto = ""
 
         self.setZValue(0)
         self.setAcceptHoverEvents(True)
@@ -210,14 +264,43 @@ class _LineaRelacion(QGraphicsPathItem):
 
         caja_origen.lineas_conectadas.append(self)
         caja_destino.lineas_conectadas.append(self)
+
+        # Etiquetas de cardinalidad ("1" en la tabla principal, "*" en la
+        # que la referencia). Mismo cuidado de referencia dura que en
+        # _CajaTabla, para que PySide6 no las bote de la memoria.
+        self._items_hijos: list = []
+        self._etiqueta_uno = QGraphicsTextItem("1", self)
+        self._etiqueta_muchos = QGraphicsTextItem("*", self)
+        for etiqueta in (self._etiqueta_uno, self._etiqueta_muchos):
+            fuente = QFont()
+            fuente.setBold(True)
+            fuente.setPointSize(9)
+            etiqueta.setFont(fuente)
+            etiqueta.setZValue(2)
+            self._items_hijos.append(etiqueta)
+
         self.actualizar_geometria()
 
+    # -- cuál de las relaciones del grupo manda sobre el color/estilo -----
+
+    def _representativa(self) -> RelacionSugerida:
+        """La relación más "fuerte" del grupo, usada para decidir el
+        color, el grosor, el estilo de línea y la dirección (1/*) que se
+        dibuja. Se prioriza una relación detectada automáticamente (con
+        más confianza) por sobre una agregada a mano, porque la manual
+        no trae información de cuál tabla es la principal."""
+        automaticas = [r for r in self.relaciones if not getattr(r, "manual", False)]
+        if automaticas:
+            return max(automaticas, key=lambda r: r.confianza)
+        return self.relaciones[0]
+
     def _color_por_confianza(self) -> QColor:
-        if getattr(self.relacion, "manual", False):
-            return QColor(COLOR_ACCENT_3)   # relación agregada a mano por el usuario
-        if getattr(self.relacion, "certeza_direccion", "alta") == "sin_definir":
-            return QColor(COLOR_DANGER)     # dirección padre/hijo sin confirmar: salta a la vista
-        c = self.relacion.confianza
+        r = self._representativa()
+        if getattr(r, "manual", False):
+            return QColor(COLOR_ACCENT_3)  # relación agregada a mano por el usuario
+        if getattr(r, "certeza_direccion", "alta") == "sin_definir":
+            return QColor(COLOR_DANGER)    # dirección padre/hijo sin confirmar: salta a la vista
+        c = r.confianza
         if c >= 0.75:
             return QColor(COLOR_ACCENT)
         if c >= 0.5:
@@ -225,22 +308,21 @@ class _LineaRelacion(QGraphicsPathItem):
         return QColor(self.colors["muted"])
 
     def actualizar_geometria(self):
-        r = self.relacion
-        p1 = self.caja_origen.punto_ancla(r.columna_origen, "derecha")
-        p2 = self.caja_destino.punto_ancla(r.columna_destino, "izquierda")
+        r = self._representativa()
 
+        p1 = self.caja_origen.punto_borde("derecha")
+        p2 = self.caja_destino.punto_borde("izquierda")
         # si la caja destino terminó quedando a la izquierda de la origen,
         # usamos los bordes contrarios para que la línea no cruce por
         # ENCIMA de las cajas de forma antiestética
         if p2.x() < p1.x():
-            p1 = self.caja_origen.punto_ancla(r.columna_origen, "izquierda")
-            p2 = self.caja_destino.punto_ancla(r.columna_destino, "derecha")
+            p1 = self.caja_origen.punto_borde("izquierda")
+            p2 = self.caja_destino.punto_borde("derecha")
 
+        # Línea recta (antes era una curva Bézier) -- más ordenada y más
+        # parecida a cómo se ven los diagramas de relaciones en Power BI.
         camino = QPainterPath(p1)
-        dx = max(abs(p2.x() - p1.x()) * 0.5, 40)
-        ctrl1 = QPointF(p1.x() + dx if p2.x() >= p1.x() else p1.x() - dx, p1.y())
-        ctrl2 = QPointF(p2.x() - dx if p2.x() >= p1.x() else p2.x() + dx, p2.y())
-        camino.cubicTo(ctrl1, ctrl2, p2)
+        camino.lineTo(p2)
         self.setPath(camino)
 
         color = self._color_por_confianza()
@@ -253,22 +335,53 @@ class _LineaRelacion(QGraphicsPathItem):
             pen.setStyle(Qt.DotLine)
         self.setPen(pen)
 
-    def hoverEnterEvent(self, event):
-        etiqueta = getattr(self.relacion, "manual", False)
-        certeza_direccion = getattr(self.relacion, "certeza_direccion", "alta")
-        if etiqueta:
-            linea_direccion = "Agregada manualmente"
+        # Etiquetas de cardinalidad: solo se dibujan si Hadar (o el
+        # usuario) ya sabe cuál tabla es la principal. Si no, se ocultan
+        # y la línea punteada ya avisa que falta confirmarlo.
+        if r.tabla_principal == self.caja_origen.nombre_tabla:
+            punto_uno, punto_muchos = p1, p2
+        elif r.tabla_principal == self.caja_destino.nombre_tabla:
+            punto_uno, punto_muchos = p2, p1
         else:
-            linea_direccion = f"{int(self.relacion.confianza*100)}% de confianza"
-        aviso_direccion = ""
-        if not etiqueta and certeza_direccion == "sin_definir":
-            aviso_direccion = "\n⚠ No está claro cuál tabla es la principal — clic derecho para elegirla"
-        self._tooltip_texto = (
-            f"{self.relacion.tabla_origen}.{self.relacion.columna_origen} <-> "
-            f"{self.relacion.tabla_destino}.{self.relacion.columna_destino}\n"
-            f"{linea_direccion}\n"
-            f"{self.relacion.razon}{aviso_direccion}\n(clic derecho para más opciones)"
-        )
+            punto_uno = punto_muchos = None
+
+        if punto_uno is not None:
+            pos_uno = _punto_desplazado(punto_uno, punto_muchos, DISTANCIA_ETIQUETA_CARDINALIDAD)
+            pos_muchos = _punto_desplazado(punto_muchos, punto_uno, DISTANCIA_ETIQUETA_CARDINALIDAD)
+            self._etiqueta_uno.setPlainText("1")
+            self._etiqueta_uno.setDefaultTextColor(color)
+            self._etiqueta_uno.setPos(pos_uno.x() - 5, pos_uno.y() - 10)
+            self._etiqueta_muchos.setPlainText("*")
+            self._etiqueta_muchos.setDefaultTextColor(color)
+            self._etiqueta_muchos.setPos(pos_muchos.x() - 5, pos_muchos.y() - 12)
+            self._etiqueta_uno.setVisible(True)
+            self._etiqueta_muchos.setVisible(True)
+        else:
+            self._etiqueta_uno.setVisible(False)
+            self._etiqueta_muchos.setVisible(False)
+
+    # -- tooltip: resume todas las columnas que esta línea agrupa ---------
+
+    def _armar_tooltip(self) -> str:
+        lineas = []
+        for r in self.relaciones:
+            if getattr(r, "manual", False):
+                etiqueta = "Agregada manualmente"
+            else:
+                etiqueta = f"{int(r.confianza * 100)}% de confianza"
+            aviso = ""
+            if not getattr(r, "manual", False) and getattr(r, "certeza_direccion", "alta") == "sin_definir":
+                aviso = " ⚠ dirección sin confirmar"
+            lineas.append(
+                f"{r.tabla_origen}.{r.columna_origen} ↔ {r.tabla_destino}.{r.columna_destino} "
+                f"({etiqueta}){aviso}"
+            )
+            lineas.append(f"   {r.razon}")
+        lineas.append("(clic derecho para más opciones)")
+        return "\n".join(lineas)
+
+    def hoverEnterEvent(self, event):
+        self._tooltip_texto = self._armar_tooltip()
         QToolTip.showText(event.screenPos(), self._tooltip_texto)
         pen = self.pen()
         pen.setWidthF(pen.widthF() + 1.5)
@@ -281,9 +394,8 @@ class _LineaRelacion(QGraphicsPathItem):
         # se siga moviendo (aunque sea un poco) dentro de la línea, se
         # vuelve a pedir que se muestre, lo que le renueva el tiempo. Así
         # el tooltip dura mientras el usuario lo esté leyendo de verdad.
-        texto = getattr(self, "_tooltip_texto", None)
-        if texto:
-            QToolTip.showText(event.screenPos(), texto)
+        if self._tooltip_texto:
+            QToolTip.showText(event.screenPos(), self._tooltip_texto)
         super().hoverMoveEvent(event)
 
     def hoverLeaveEvent(self, event):
@@ -291,26 +403,30 @@ class _LineaRelacion(QGraphicsPathItem):
         super().hoverLeaveEvent(event)
 
     def contextMenuEvent(self, event):
-        r = self.relacion
+        no_manuales = [r for r in self.relaciones if not getattr(r, "manual", False)]
         menu = QMenu()
-        accion_eliminar = menu.addAction("Eliminar esta relación")
+        if len(self.relaciones) == 1:
+            accion_eliminar = menu.addAction("Eliminar esta relación")
+        else:
+            accion_eliminar = menu.addAction(f"Eliminar esta relación ({len(self.relaciones)} columnas)")
 
         accion_principal_origen = None
         accion_principal_destino = None
-        if not getattr(r, "manual", False) and self._on_confirmar_direccion is not None:
+        if no_manuales and self._on_confirmar_direccion is not None:
+            r = self._representativa()
             menu.addSeparator()
-            marca_o = "  ✓" if r.tabla_principal == r.tabla_origen else ""
-            marca_d = "  ✓" if r.tabla_principal == r.tabla_destino else ""
-            accion_principal_origen = menu.addAction(f'"{r.tabla_origen}" es la tabla principal{marca_o}')
-            accion_principal_destino = menu.addAction(f'"{r.tabla_destino}" es la tabla principal{marca_d}')
+            marca_o = " ✓" if r.tabla_principal == self.caja_origen.nombre_tabla else ""
+            marca_d = " ✓" if r.tabla_principal == self.caja_destino.nombre_tabla else ""
+            accion_principal_origen = menu.addAction(f'"{self.caja_origen.nombre_tabla}" es la tabla principal{marca_o}')
+            accion_principal_destino = menu.addAction(f'"{self.caja_destino.nombre_tabla}" es la tabla principal{marca_d}')
 
         elegida = menu.exec(event.screenPos())
         if elegida == accion_eliminar:
-            self._on_eliminar(self)
+            self._on_eliminar(list(self.relaciones))
         elif elegida is not None and elegida == accion_principal_origen:
-            self._on_confirmar_direccion(self, r.tabla_origen, r.columna_origen)
+            self._on_confirmar_direccion(self.caja_origen.nombre_tabla, no_manuales)
         elif elegida is not None and elegida == accion_principal_destino:
-            self._on_confirmar_direccion(self, r.tabla_destino, r.columna_destino)
+            self._on_confirmar_direccion(self.caja_destino.nombre_tabla, no_manuales)
 
 
 # ----------------------------------------------------------------------
@@ -343,6 +459,7 @@ class DialogoEsquemaOntologia(QDialog):
             self.relaciones: list[RelacionSugerida] = list(relaciones_iniciales)
         else:
             self.relaciones: list[RelacionSugerida] = inferir_relaciones(tablas)
+
         self._cajas: dict[str, _CajaTabla] = {}
         self._lineas: list[_LineaRelacion] = []
 
@@ -355,9 +472,11 @@ class DialogoEsquemaOntologia(QDialog):
         layout.addWidget(titulo)
 
         ayuda = QLabel(
-            "Hadar detectó estas conexiones solo. Arrastra las tablas para acomodarlas. "
-            "Clic derecho sobre una línea para borrarla si está mal. "
-            "Si falta una relación, agrégala con el botón de abajo."
+            "Hadar detectó estas conexiones solo. Cada línea une dos tablas (puede resumir "
+            "más de una columna en común); el extremo marcado \"1\" es la tabla principal y "
+            "el extremo \"*\" es la que la referencia muchas veces. Arrastra las tablas para "
+            "acomodarlas. Clic derecho sobre una línea para borrarla o corregir cuál tabla es "
+            "la principal. Si falta una relación, agrégala con el botón de abajo."
         )
         ayuda.setWordWrap(True)
         ayuda.setStyleSheet(f"color: {colors['muted']}; font-size: 11px;")
@@ -375,8 +494,8 @@ class DialogoEsquemaOntologia(QDialog):
         )
         self.btn_redetectar.clicked.connect(self._redetectar)
         barra.addWidget(self.btn_redetectar)
-        barra.addStretch()
 
+        barra.addStretch()
         self.lbl_resumen = QLabel("")
         self.lbl_resumen.setStyleSheet(f"color: {colors['muted']}; font-size: 11px;")
         barra.addWidget(self.lbl_resumen)
@@ -397,8 +516,10 @@ class DialogoEsquemaOntologia(QDialog):
             f"<span style='color:{COLOR_ACCENT_2}'>●</span> confianza media&nbsp;&nbsp;"
             f"<span style='color:{colors['muted']}'>●</span> confianza baja&nbsp;&nbsp;"
             f"<span style='color:{COLOR_ACCENT_3}'>- - -</span> agregada por ti&nbsp;&nbsp;"
-            f"<span style='color:{COLOR_DANGER}'>···</span> dirección sin confirmar (clic derecho)"
+            f"<span style='color:{COLOR_DANGER}'>···</span> dirección sin confirmar (clic derecho)&nbsp;&nbsp;"
+            f"<b>1 / *</b> tabla principal / tabla referenciada"
         )
+        leyenda.setWordWrap(True)
         leyenda.setStyleSheet("font-size: 11px;")
         layout.addWidget(leyenda)
 
@@ -439,52 +560,93 @@ class DialogoEsquemaOntologia(QDialog):
                 max_alto_fila = 0
 
     def _dibujar_relaciones(self):
+        # Agrupa todas las relaciones que conectan el MISMO par de tablas
+        # en un solo grupo, para dibujar una sola línea por par (en vez de
+        # una por cada columna que calzó). El orden de tabla_origen /
+        # tabla_destino de cada relación dentro del grupo no importa acá:
+        # _LineaRelacion compara por NOMBRE de tabla, no por rol.
+        grupos: dict[frozenset, list[RelacionSugerida]] = {}
         for r in self.relaciones:
-            caja_o = self._cajas.get(r.tabla_origen)
-            caja_d = self._cajas.get(r.tabla_destino)
+            clave = frozenset((r.tabla_origen, r.tabla_destino))
+            grupos.setdefault(clave, []).append(r)
+
+        for relaciones_grupo in grupos.values():
+            primera = relaciones_grupo[0]
+            caja_o = self._cajas.get(primera.tabla_origen)
+            caja_d = self._cajas.get(primera.tabla_destino)
             if not caja_o or not caja_d:
                 continue
-            linea = _LineaRelacion(r, caja_o, caja_d, self.colors, self._eliminar_relacion, self._confirmar_direccion)
+
+            linea = _LineaRelacion(
+                relaciones_grupo, caja_o, caja_d, self.colors,
+                self._eliminar_relaciones, self._confirmar_direccion_grupo,
+            )
             self.escena.addItem(linea)
             self._lineas.append(linea)
-            caja_o.resaltar_columna(r.columna_origen, linea._color_por_confianza())
-            caja_d.resaltar_columna(r.columna_destino, linea._color_por_confianza())
+
+            color = linea._color_por_confianza()
+            for r in relaciones_grupo:
+                caja_r_origen = self._cajas.get(r.tabla_origen)
+                caja_r_destino = self._cajas.get(r.tabla_destino)
+                if caja_r_origen:
+                    caja_r_origen.resaltar_columna(r.columna_origen, color)
+                if caja_r_destino:
+                    caja_r_destino.resaltar_columna(r.columna_destino, color)
 
     def _actualizar_resumen(self):
         n = len(self.relaciones)
+        n_lineas = len(self._lineas)
         manuales = sum(1 for r in self.relaciones if getattr(r, "manual", False))
         if n == 0:
             self.lbl_resumen.setText("No se detectaron relaciones todavía.")
         else:
             extra = f" ({manuales} agregada(s) por ti)" if manuales else ""
-            self.lbl_resumen.setText(f"{n} relación(es) sugerida(s){extra}")
+            detalle_columnas = f" en {n} columna(s)" if n != n_lineas else ""
+            self.lbl_resumen.setText(f"{n_lineas} relación(es) entre tablas{detalle_columnas}{extra}")
 
     # ------------------------------------------------------------------
     # Acciones del usuario
     # ------------------------------------------------------------------
 
-    def _eliminar_relacion(self, linea: _LineaRelacion):
-        respuesta = QMessageBox.question(
-            self, "Eliminar relación",
-            f"¿Eliminar la relación entre \"{linea.relacion.tabla_origen}."
-            f"{linea.relacion.columna_origen}\" y \"{linea.relacion.tabla_destino}."
-            f"{linea.relacion.columna_destino}\"?",
-        )
+    def _eliminar_relaciones(self, relaciones: list[RelacionSugerida]):
+        if len(relaciones) == 1:
+            r = relaciones[0]
+            pregunta = (
+                f"¿Eliminar la relación entre \"{r.tabla_origen}.{r.columna_origen}\" "
+                f"y \"{r.tabla_destino}.{r.columna_destino}\"?"
+            )
+        else:
+            detalle = "\n".join(
+                f"- {r.tabla_origen}.{r.columna_origen} ↔ {r.tabla_destino}.{r.columna_destino}"
+                for r in relaciones
+            )
+            pregunta = f"¿Eliminar estas {len(relaciones)} relaciones?\n{detalle}"
+
+        respuesta = QMessageBox.question(self, "Eliminar relación", pregunta)
         if respuesta != QMessageBox.Yes:
             return
-        if linea.relacion in self.relaciones:
-            self.relaciones.remove(linea.relacion)
+        for r in relaciones:
+            if r in self.relaciones:
+                self.relaciones.remove(r)
         self._dibujar_todo()
 
-    def _confirmar_direccion(self, linea: _LineaRelacion, tabla_elegida: str, columna_elegida: str):
+    def _confirmar_direccion_grupo(self, tabla_elegida: str, relaciones_afectadas: list[RelacionSugerida]):
         """El usuario eligió a mano, desde el clic derecho, cuál tabla es
-        la principal de esta relación (para corregir un 'sin_definir', o
-        simplemente porque el motor adivinó mal)."""
-        r = linea.relacion
-        r.tabla_principal = tabla_elegida
-        r.columna_principal = columna_elegida
-        r.certeza_direccion = "alta"
-        r.direccion_confirmada = True
+        la principal para esta línea (para corregir un 'sin_definir', o
+        simplemente porque el motor adivinó mal). Se aplica a todas las
+        relaciones automáticas que comparten esa línea, para que la
+        cardinalidad mostrada sea consistente."""
+        for r in relaciones_afectadas:
+            if r.tabla_origen == tabla_elegida:
+                r.tabla_principal = tabla_elegida
+                r.columna_principal = r.columna_origen
+            elif r.tabla_destino == tabla_elegida:
+                r.tabla_principal = tabla_elegida
+                r.columna_principal = r.columna_destino
+            else:
+                continue
+            r.certeza_direccion = "alta"
+            r.direccion_confirmada = True
         self._dibujar_todo()
 
     def _redetectar(self):
@@ -500,6 +662,7 @@ class DialogoEsquemaOntologia(QDialog):
             for r in self.relaciones
             if getattr(r, "direccion_confirmada", False) and not getattr(r, "manual", False)
         }
+
         nuevas_auto = inferir_relaciones(self.tablas)
 
         claves_manuales = {
@@ -537,6 +700,7 @@ class DialogoEsquemaOntologia(QDialog):
             if ya_existe:
                 QMessageBox.information(self, "Ya existe", "Esa relación ya está en el esquema.")
                 return
+
             nueva = RelacionSugerida(
                 tabla_origen=t1, columna_origen=c1,
                 tabla_destino=t2, columna_destino=c2,
