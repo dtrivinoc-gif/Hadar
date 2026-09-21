@@ -21,6 +21,8 @@ from .regimen import detectar_quiebres_de_comportamiento
 from .procedencia import (
     TIPO_COLUMNA_CALCULADA, evento_de_columna, evento_de_origen, resolver_columnas_base,
     usa_su_propio_valor_anterior, expresion_a_texto_amigable, fecha_legible, _nombre_de_fuente,
+    TIPO_LIMPIEZA, TIPO_EDICION_MANUAL, estado_de_actualizacion, frase_desactualizacion,
+    FRASE_OPERACION_INDICADOR as _FRASE_OPERACION_INDICADOR,
 )
 
 class QuestionAssistant:
@@ -543,20 +545,6 @@ _CSS_LIBRO = """
 """
 
 
-# Cómo se dice, en lenguaje llano, la operación de un Indicador simple. Se
-# repite acá (en vez de importar indicadores.py) para que narrativa.py siga sin
-# depender de la clase Indicador: solo necesita objetos con los mismos campos.
-_FRASE_OPERACION_INDICADOR = {
-    "suma": "suma de",
-    "promedio": "promedio de",
-    "mediana": "mediana de",
-    "minimo": "valor mínimo de",
-    "maximo": "valor máximo de",
-    "conteo": "cantidad de datos en",
-    "conteo_unico": "cantidad de valores distintos en",
-}
-
-
 class NarrativeGenerator:
     """Arma el informe HTML tipo libro a partir de datos reales del df y de
     las anomalías ya detectadas. El capítulo de Relaciones entre variables
@@ -707,6 +695,30 @@ class NarrativeGenerator:
             f"{detalle_html}</div>"
         )
 
+    @staticmethod
+    def _origen_hechos_html(hechos):
+        """'Qué se le hizo a los datos': las correcciones de Limpieza sugerida y
+        los cambios a mano, en orden. Cada línea sale de lo que se anotó al
+        aplicarla (comparando antes y después), no de una suposición."""
+        esc = html.escape
+        items = []
+        for e in hechos:
+            fecha = fecha_legible(e.fecha)
+            extra = ""
+            if e.tipo == TIPO_LIMPIEZA and e.detalle.get("subtipo") == "duplicado":
+                extra = (
+                    f" La tabla pasó de {e.detalle.get('filas_antes', 0):,} "
+                    f"a {e.detalle.get('filas_despues', 0):,} filas."
+                )
+            prefijo = f"<b>{esc(fecha)}</b> · " if fecha else ""
+            items.append(f"<li>{prefijo}{esc(e.descripcion)}{esc(extra)}</li>")
+        return (
+            "<h3>Qué se le hizo a los datos</h3>"
+            "<p class='pendiente'>Correcciones hechas dentro de Hadar, en orden. "
+            "El archivo original no se modificó.</p>"
+            "<ul>" + "".join(items) + "</ul>"
+        )
+
     def _capitulo_origen(self, n):
         """Origen de los datos: de dónde sale cada cifra que NO viene tal cual
         de la carga -- las columnas que Hadar calculó (con su fórmula y las
@@ -719,11 +731,23 @@ class NarrativeGenerator:
             if e.tipo == TIPO_COLUMNA_CALCULADA and e.columna in self.df.columns
         ]
         origen = evento_de_origen(self.eventos_procedencia)
-        if origen is None and not calculadas and not self.indicadores:
+        # Limpiezas y cambios a mano, en orden (una edición a mano solo cuenta si su
+        # columna sigue existiendo).
+        hechos = sorted(
+            (
+                e for e in self.eventos_procedencia
+                if e.tipo == TIPO_LIMPIEZA
+                or (e.tipo == TIPO_EDICION_MANUAL and e.columna in self.df.columns)
+            ),
+            key=lambda e: e.fecha or "",
+        )
+        if origen is None and not hechos and not calculadas and not self.indicadores:
             return None
 
         esc = html.escape
         partes = [self._origen_fuente_html(origen)]
+        if hechos:
+            partes.append(self._origen_hechos_html(hechos))
 
         if calculadas:
             bloques = []
@@ -751,6 +775,11 @@ class NarrativeGenerator:
                 fecha = fecha_legible(e.fecha)
                 if fecha:
                     detalle.append(f"Calculada el {fecha}.")
+                aviso = frase_desactualizacion(
+                    estado_de_actualizacion(self.eventos_procedencia, e.columna)
+                )
+                if aviso:
+                    detalle.append(f"<b>Ojo:</b> {esc(aviso)}")
                 detalle_html = "".join(f"<div class='origen-detalle'>{d}</div>" for d in detalle)
                 bloques.append(
                     f"<div class='origen'><div class='origen-titulo'>{esc(str(e.columna))}</div>"

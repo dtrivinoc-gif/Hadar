@@ -23,7 +23,7 @@ class PandasTableModel(QAbstractTableModel):
     def __init__(self, df: pd.DataFrame = None):
         super().__init__()
         self._df = df if df is not None else pd.DataFrame()
-        # callback opcional: on_edit(row_label, col_name, nuevo_valor)
+        # callback opcional: on_edit(row_label, col_name, nuevo_valor, valor_anterior)
         # que HadarApp usa para propagar la edición al DataFrame maestro.
         self.on_edit = None
         self.editable = False
@@ -50,6 +50,9 @@ class PandasTableModel(QAbstractTableModel):
         # cambia cómo se ve el ENCABEZADO (marca "ƒx" + tooltip); el nombre
         # real de la columna en el DataFrame no se toca.
         self._columnas_calculadas = {}
+        # {nombre_columna: aviso} de las calculadas que pudieron quedar
+        # desactualizadas (se modificaron datos de los que salen).
+        self._columnas_desactualizadas = {}
         # Iconos: se crean una sola vez (no en cada data(), que se llama por
         # cada celda visible en cada repintado).
         self._icono_anomalia = self._crear_icono_punto(COLOR_DANGER)
@@ -192,9 +195,11 @@ class PandasTableModel(QAbstractTableModel):
         idx = self.index(int(row), int(col))
         self.dataChanged.emit(idx, idx, [Qt.DecorationRole, Qt.BackgroundRole, Qt.ToolTipRole])
 
-    def set_columnas_calculadas(self, mapa):
-        """mapa: {nombre_columna: fórmula}. Refresca solo los encabezados."""
+    def set_columnas_calculadas(self, mapa, avisos=None):
+        """mapa: {nombre_columna: fórmula}. avisos: {nombre_columna: texto} solo
+        para las que pudieron quedar desactualizadas. Refresca solo los encabezados."""
         self._columnas_calculadas = dict(mapa or {})
+        self._columnas_desactualizadas = dict(avisos or {})
         n = self.columnCount()
         if n:
             self.headerDataChanged.emit(Qt.Horizontal, 0, n - 1)
@@ -275,11 +280,12 @@ class PandasTableModel(QAbstractTableModel):
         nuevo_valor = cast_valor_a_dtype(str(value), dtype)
         row_label = self._df.index[row]
 
+        valor_anterior = self._df.iat[row, col]
         self._df.iat[row, col] = nuevo_valor
         self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
 
         if self.on_edit is not None:
-            self.on_edit(row_label, col_name, nuevo_valor)
+            self.on_edit(row_label, col_name, nuevo_valor, valor_anterior)
         return True
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
@@ -293,14 +299,20 @@ class PandasTableModel(QAbstractTableModel):
             if role == Qt.EditRole:
                 return nombre
             formula = self._columnas_calculadas.get(nombre)
+            aviso = self._columnas_desactualizadas.get(nombre)
             if role == Qt.DisplayRole:
-                return f"ƒx {nombre}" if formula is not None else nombre
+                if formula is None:
+                    return nombre
+                return f"ƒx ⚠ {nombre}" if aviso else f"ƒx {nombre}"
             if role == Qt.ToolTipRole and formula is not None:
-                return (
+                texto = (
                     "Columna calculada en Hadar\n"
                     f"= {formula}\n"
                     "Se calculó una sola vez: no se actualiza sola si cambias los datos."
                 )
+                if aviso:
+                    texto += f"\n\nOjo: {aviso}"
+                return texto
             return None
         if role != Qt.DisplayRole:
             return None

@@ -15,8 +15,12 @@ medida que actúan, en vez de intentar reconstruir la historia después.
 Etapa 1: columnas calculadas ("Excel: Calcular y Arrastrar").
 Etapa 2: de dónde vino la tabla (archivo, hoja, o base SQL Server) y cuándo
 se cargó.
-El tipo "limpieza" está previsto para la etapa 3; el formato guardado ya lo
-admite sin cambios.
+Etapa 3: qué se le hizo a los datos dentro de Hadar (limpieza sugerida y
+cambios a mano en Datos), y el aviso de columnas calculadas que pudieron
+quedar desactualizadas porque después se modificaron los datos de los que salen.
+
+Convención: en los eventos de limpieza y de edición a mano, `depende_de` son
+las columnas cuyos VALORES se modificaron.
 """
 import os
 import re
@@ -27,8 +31,11 @@ from .formulas import extraer_columnas_formula, FormulaSeguridadError
 
 TIPO_COLUMNA_CALCULADA = "columna_calculada"
 TIPO_ARCHIVO_ORIGEN = "archivo_origen"
-# Previsto para la etapa 3 (todavía no se registra):
 TIPO_LIMPIEZA = "limpieza"
+TIPO_EDICION_MANUAL = "edicion_manual"
+# Los eventos de estos tipos cambian VALORES de columnas ya existentes (a
+# diferencia de eliminar filas duplicadas, que no altera lo que dice cada fila).
+TIPOS_QUE_MODIFICAN_VALORES = (TIPO_LIMPIEZA, TIPO_EDICION_MANUAL)
 
 # Valores de detalle["origen"] en un evento de TIPO_ARCHIVO_ORIGEN.
 ORIGEN_ARCHIVO = "archivo"        # csv / xlsx / xls / parquet / .sql
@@ -61,6 +68,110 @@ def fecha_legible(fecha_iso):
 
 def _descripcion_columna_calculada(columna, formula_texto):
     return f"«{columna}» se calculó con la fórmula {formula_texto}."
+
+
+# Cómo se dice, en lenguaje llano, la operación de un Indicador simple. Vive acá (y no
+# en indicadores.py) para que el informe y el diagrama de Origen puedan describir un
+# indicador sin importar la clase Indicador ni PySide6: solo necesitan objetos con
+# .nombre, .operacion, .columna, .formula y .columnas_de_las_que_depende().
+FRASE_OPERACION_INDICADOR = {
+    "suma": "suma de",
+    "promedio": "promedio de",
+    "mediana": "mediana de",
+    "minimo": "valor mínimo de",
+    "maximo": "valor máximo de",
+    "conteo": "cantidad de datos en",
+    "conteo_unico": "cantidad de valores distintos en",
+}
+
+
+def _n_celdas(n):
+    return "1 celda" if n == 1 else f"{n:,} celdas"
+
+
+def _columnas_con_conteo(celdas_por_columna, tope=5):
+    """{'nombre': 8, 'ciudad': 4} -> 'nombre: 8, ciudad: 4' (las de más
+    cambios primero; si son muchas, 'y N columnas más')."""
+    orden = sorted(celdas_por_columna.items(), key=lambda kv: (-kv[1], kv[0]))
+    txt = ", ".join(f"{c}: {n:,}" for c, n in orden[:tope])
+    if len(orden) > tope:
+        txt += f" y {len(orden) - tope} columnas más"
+    return txt
+
+
+_FRASE_LIMPIEZA = {
+    "espacio_en_blanco": "Se recortaron los espacios de más en {celdas}",
+    "formato_inconsistente": "Se unificó el formato (mayúsculas, minúsculas y variantes) en {celdas}",
+    "caracter_especial": "Se quitaron caracteres especiales en {celdas}",
+    "numero_en_texto": "Se pasaron a número los valores de {celdas} que estaban escritos como texto",
+}
+
+
+def _descripcion_limpieza(subtipo, detalle):
+    if subtipo == "duplicado":
+        n = detalle.get("filas_eliminadas", 0)
+        if n == 1:
+            return "Se eliminó 1 fila duplicada (se conservó la primera de cada grupo)."
+        return f"Se eliminaron {n:,} filas duplicadas (se conservó la primera de cada grupo)."
+    celdas = detalle.get("celdas_por_columna") or {}
+    base = _FRASE_LIMPIEZA.get(subtipo, "Se corrigieron datos en {celdas}").format(
+        celdas=_n_celdas(detalle.get("celdas_total", 0))
+    )
+    if subtipo == "caracter_especial" and detalle.get("caracteres"):
+        base += " (" + " ".join(detalle["caracteres"]) + ")"
+    if celdas:
+        base += f" — {_columnas_con_conteo(celdas)}"
+    return base + "."
+
+
+def _descripcion_edicion_manual(columna, detalle):
+    n = detalle.get("cambios", 0)
+    veces = "1 cambio" if n == 1 else f"{n:,} cambios"
+    return f"Se hicieron {veces} a mano en «{columna}»."
+
+
+def _iguales(a, b):
+    try:
+        if a is None and b is None:
+            return True
+        if a != a and b != b:   # ambos NaN
+            return True
+        return bool(a == b)
+    except Exception:
+        return str(a) == str(b)
+
+
+def resumir_cambios(antes, despues):
+    """Compara una tabla ANTES y DESPUÉS de una corrección y devuelve lo que
+    realmente cambió (no lo que se pensaba cambiar): filas antes/después y,
+    por columna, cuántas celdas quedaron con otro valor. Solo compara las
+    filas que siguen existiendo. Nunca lanza: si algo no se puede comparar,
+    esa columna simplemente no aporta conteo."""
+    resumen = {
+        "filas_antes": len(antes), "filas_despues": len(despues),
+        "celdas_por_columna": {},
+    }
+    try:
+        if not (antes.index.is_unique and despues.index.is_unique
+                and antes.columns.is_unique and despues.columns.is_unique
+                and despues.index.isin(antes.index).all()):
+            return resumen
+        comunes = [c for c in antes.columns if c in despues.columns]
+        a = antes.loc[despues.index, comunes]
+        b = despues[comunes]
+        for c in comunes:
+            sa, sb = a[c], b[c]
+            try:
+                distintas = ~((sa == sb) | (sa.isna() & sb.isna()))
+            except Exception:
+                sa2, sb2 = sa.astype(str), sb.astype(str)
+                distintas = sa2 != sb2
+            n = int(distintas.sum())
+            if n:
+                resumen["celdas_por_columna"][str(c)] = n
+    except Exception:
+        pass
+    return resumen
 
 
 def _nombre_de_fuente(detalle):
@@ -147,6 +258,74 @@ def usa_su_propio_valor_anterior(evento):
     return evento.columna is not None and evento.columna in evento.depende_de
 
 
+def estado_de_actualizacion(eventos, columna, _visitando=None):
+    """¿Una columna calculada pudo quedar desactualizada? Lo está si, DESPUÉS
+    de calcularla, se modificaron los valores de alguna columna de la que sale
+    (por limpieza o a mano), si sale de otra columna calculada que ya lo
+    está, o si alguna de las columnas calculadas de las que sale se volvió a
+    calcular DESPUÉS que ella. Devuelve {'modificaciones': [eventos],
+    'columnas_tocadas': [...], 'arrastrada_de': [calculadas desactualizadas de
+    las que sale], 'recalculadas_despues': [calculadas de las que sale y que se
+    recalcularon más tarde]}. Es una advertencia, no una certeza: solo compara
+    fechas de la bitácora, no recalcula nada."""
+    vacio = {"modificaciones": [], "columnas_tocadas": [], "arrastrada_de": [],
+             "recalculadas_despues": []}
+    ev = evento_de_columna(eventos, columna)
+    if ev is None or not ev.fecha:
+        return vacio
+    visitando = (_visitando or set()) | {columna}
+    directas = [d for d in ev.depende_de if d != columna]
+    modificaciones = [
+        e for e in eventos
+        if e.tipo in TIPOS_QUE_MODIFICAN_VALORES and e.fecha and e.fecha > ev.fecha
+        and set(e.depende_de) & set(directas)
+    ]
+    tocadas = sorted({c for e in modificaciones for c in e.depende_de if c in directas})
+    arrastrada, recalculadas = [], []
+    for d in directas:
+        ev_d = evento_de_columna(eventos, d)
+        if d in visitando or ev_d is None:
+            continue
+        if ev_d.fecha and ev_d.fecha > ev.fecha:
+            recalculadas.append(d)
+            continue
+        st = estado_de_actualizacion(eventos, d, visitando)
+        if esta_desactualizada(st):
+            arrastrada.append(d)
+    return {"modificaciones": modificaciones, "columnas_tocadas": tocadas,
+            "arrastrada_de": arrastrada, "recalculadas_despues": recalculadas}
+
+
+def esta_desactualizada(estado):
+    return bool(estado["modificaciones"] or estado["arrastrada_de"] or estado["recalculadas_despues"])
+
+
+def frase_desactualizacion(estado, larga=True):
+    """Aviso en lenguaje llano (sin emojis). '' si no hay nada que avisar."""
+    if not esta_desactualizada(estado):
+        return ""
+    partes = []
+    if estado["columnas_tocadas"]:
+        partes.append(
+            "Después de calcularla se modificaron datos de: "
+            + ", ".join(estado["columnas_tocadas"]) + "."
+        )
+    if estado["recalculadas_despues"]:
+        partes.append(
+            "Sale de columnas calculadas que se volvieron a calcular después: "
+            + ", ".join(estado["recalculadas_despues"]) + "."
+        )
+    if estado["arrastrada_de"]:
+        partes.append(
+            "Sale de columnas calculadas que ya quedaron desactualizadas: "
+            + ", ".join(estado["arrastrada_de"]) + "."
+        )
+    partes.append("Puede estar desactualizada.")
+    if larga:
+        partes.append("Para ponerla al día, créala otra vez con la misma fórmula y el mismo nombre.")
+    return " ".join(partes)
+
+
 class BitacoraProcedencia:
     """Lista de eventos de procedencia de todas las tablas del proyecto."""
 
@@ -167,9 +346,12 @@ class BitacoraProcedencia:
             depende_de = sorted(extraer_columnas_formula(expresion))
         except FormulaSeguridadError:
             depende_de = []
+        # Se reemplaza el evento anterior de esa columna y también los cambios a
+        # mano hechos sobre la versión anterior (esos valores ya no existen).
         self._eventos = [
             e for e in self._eventos
-            if not (e.tipo == TIPO_COLUMNA_CALCULADA and e.tabla == tabla and e.columna == columna)
+            if not (e.tabla == tabla and e.columna == columna
+                    and e.tipo in (TIPO_COLUMNA_CALCULADA, TIPO_EDICION_MANUAL))
         ]
         evento = EventoProcedencia(
             tipo=TIPO_COLUMNA_CALCULADA,
@@ -273,6 +455,51 @@ class BitacoraProcedencia:
             completadas += 1
         return completadas
 
+    def registrar_limpieza(self, tabla, subtipo, df_antes, df_despues, caracteres=None, fecha=None):
+        """Anota una corrección de la Limpieza sugerida. Lo que se guarda sale
+        de comparar la tabla antes y después (cuántas filas se eliminaron,
+        cuántas celdas cambiaron y en qué columnas), no de lo que se esperaba.
+        Si la corrección no cambió nada, no se anota. Devuelve el evento o None."""
+        resumen = resumir_cambios(df_antes, df_despues)
+        eliminadas = resumen["filas_antes"] - resumen["filas_despues"]
+        celdas = resumen["celdas_por_columna"]
+        if eliminadas <= 0 and not celdas:
+            return None
+        detalle = {
+            "subtipo": subtipo,
+            "filas_antes": resumen["filas_antes"], "filas_despues": resumen["filas_despues"],
+            "filas_eliminadas": max(eliminadas, 0),
+            "celdas_por_columna": celdas, "celdas_total": sum(celdas.values()),
+        }
+        if caracteres:
+            detalle["caracteres"] = list(caracteres)
+        evento = EventoProcedencia(
+            tipo=TIPO_LIMPIEZA, tabla=tabla, columna=None, depende_de=sorted(celdas),
+            descripcion=_descripcion_limpieza(subtipo, detalle),
+            fecha=fecha or _ahora_iso(), detalle=detalle,
+        )
+        self._eventos.append(evento)
+        return evento
+
+    def registrar_edicion_manual(self, tabla, columna, fecha=None):
+        """Anota un cambio hecho a mano en una celda de Datos. Los cambios a
+        una misma columna se acumulan en UN solo evento (con la fecha del
+        último), para no llenar la bitácora con una línea por celda."""
+        fecha = fecha or _ahora_iso()
+        for e in self._eventos:
+            if e.tipo == TIPO_EDICION_MANUAL and e.tabla == tabla and e.columna == columna:
+                e.detalle["cambios"] = e.detalle.get("cambios", 0) + 1
+                e.fecha = fecha
+                e.descripcion = _descripcion_edicion_manual(columna, e.detalle)
+                return e
+        detalle = {"cambios": 1, "primera_edicion": fecha}
+        evento = EventoProcedencia(
+            tipo=TIPO_EDICION_MANUAL, tabla=tabla, columna=columna, depende_de=[columna],
+            descripcion=_descripcion_edicion_manual(columna, detalle), fecha=fecha, detalle=detalle,
+        )
+        self._eventos.append(evento)
+        return evento
+
     # ------------------------------------------------------------- consultar
     def eventos_de_tabla(self, tabla, tipo=None):
         return [
@@ -298,6 +525,15 @@ class BitacoraProcedencia:
             if e.columna == viejo:
                 e.columna = nuevo
             e.depende_de = [nuevo if d == viejo else d for d in e.depende_de]
+            if e.tipo == TIPO_LIMPIEZA:
+                por_col = e.detalle.get("celdas_por_columna") or {}
+                if viejo in por_col:
+                    e.detalle["celdas_por_columna"] = {
+                        (nuevo if k == viejo else k): v for k, v in por_col.items()
+                    }
+                e.descripcion = _descripcion_limpieza(e.detalle.get("subtipo", ""), e.detalle)
+            elif e.tipo == TIPO_EDICION_MANUAL:
+                e.descripcion = _descripcion_edicion_manual(e.columna, e.detalle)
             if e.tipo == TIPO_COLUMNA_CALCULADA:
                 texto = e.detalle.get("formula_texto")
                 if texto:

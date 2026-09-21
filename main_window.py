@@ -44,9 +44,12 @@ from .indicadores import (
     Indicador, sugerir_indicadores_por_defecto, IndicadorCard, DialogoIndicador,
 )
 from .excel_transform import DialogoTransformacionExcel
+from .origen_grafo import construir_grafo_origen
+from .origen_ui import PanelOrigen
 from .procedencia import (
     BitacoraProcedencia, TIPO_COLUMNA_CALCULADA, TIPO_ARCHIVO_ORIGEN,
     ORIGEN_ARCHIVO, ORIGEN_SQL_SERVER, evento_de_origen,
+    estado_de_actualizacion, frase_desactualizacion,
 )
 from .report_widgets import (
     ReportBoxItem, REPORTE_PAPEL_BG, REPORTE_PAPEL_BORDE, REPORTE_PAPEL_TINTA,
@@ -1114,6 +1117,7 @@ class HadarApp(QMainWindow):
             self.panel_linea_tiempo.aplicar_tema(self.colors)
         if hasattr(self, "reporte_view"):
             self.reporte_view.setBackgroundBrush(QBrush(QColor(self.colors["bg"])))
+        self._refrescar_origen()
         if self.filtered_df is not None:
             self._actualizar_metricas()
             self._update_frecuencias()
@@ -1487,11 +1491,33 @@ class HadarApp(QMainWindow):
         if not hasattr(self, "table_model"):
             return
         mapa = {}
+        avisos = {}
         if self.df is not None and self.nombre_tabla_activa is not None:
-            for e in self.procedencia.eventos_de_tabla(self.nombre_tabla_activa, TIPO_COLUMNA_CALCULADA):
-                if e.columna in self.df.columns:
+            todos = self.procedencia.eventos_de_tabla(self.nombre_tabla_activa)
+            for e in todos:
+                if e.tipo == TIPO_COLUMNA_CALCULADA and e.columna in self.df.columns:
                     mapa[str(e.columna)] = e.detalle.get("formula_texto", "")
-        self.table_model.set_columnas_calculadas(mapa)
+                    aviso = frase_desactualizacion(estado_de_actualizacion(todos, e.columna), larga=False)
+                    if aviso:
+                        avisos[str(e.columna)] = aviso
+        self.table_model.set_columnas_calculadas(mapa, avisos)
+        # El encabezado con "ƒx ⚠" es más largo que el nombre: se ensancha la columna
+        # después de que la tabla termine de refrescarse (si no, se corta el texto).
+        QTimer.singleShot(0, self._ensanchar_encabezados_marcados)
+        # Esta función corre tras cada cambio que importa (cargar, calcular, limpiar,
+        # editar a mano, renombrar, cambiar de tabla): el diagrama de Origen, si está a
+        # la vista, se rehace con lo nuevo.
+        self._refrescar_origen()
+
+    def _ensanchar_encabezados_marcados(self):
+        if self.df is None or not hasattr(self, "table_view"):
+            return
+        cabecera = self.table_view.horizontalHeader()
+        columnas = [str(c) for c in self.table_model._df.columns]
+        for nombre in self.table_model._columnas_calculadas:
+            if nombre in columnas:
+                i = columnas.index(nombre)
+                cabecera.resizeSection(i, max(cabecera.sectionSize(i), cabecera.sectionSizeHint(i)))
 
     def refresh_all_column_lists(self):
         if self.df is None:
@@ -1882,11 +1908,15 @@ class HadarApp(QMainWindow):
         if not hallazgos_tipo:
             return
 
+        caracteres_quitados = None   # solo para "caracteres especiales" (cuáles eligió la persona)
         if tipo == "caracter_especial":
             dialogo = DialogoRevisarCaracteres(hallazgos_tipo, self)
             if dialogo.exec() != QDialog.DialogCode.Accepted or not dialogo.claves_elegidas:
                 return
             df_nuevo = aplicar_quitar_caracteres(self.df, hallazgos_tipo, dialogo.claves_elegidas)
+            caracteres_quitados = sorted({
+                k[1] for k in dialogo.claves_elegidas if isinstance(k, tuple) and len(k) == 2
+            })
         else:
             descripciones = {
                 "duplicado": (
@@ -1921,8 +1951,14 @@ class HadarApp(QMainWindow):
             else:
                 return
 
+        df_antes = self.df
         self.df = df_nuevo
         self.tablas[self.nombre_tabla_activa] = df_nuevo
+        # Se anota lo que REALMENTE cambió (comparando antes y después), antes de
+        # refrescar las listas para que los encabezados ya muestren los avisos.
+        self.procedencia.registrar_limpieza(
+            self.nombre_tabla_activa, tipo, df_antes, df_nuevo, caracteres=caracteres_quitados,
+        )
         self.refresh_all_column_lists()
         self.apply_table_filter()
         # Se vuelve a calcular desde cero: lo que se acaba de corregir ya
@@ -2433,7 +2469,7 @@ class HadarApp(QMainWindow):
             if activo else QAbstractItemView.NoEditTriggers
         )
 
-    def _on_table_cell_edited(self, row_label, col_name, nuevo_valor):
+    def _on_table_cell_edited(self, row_label, col_name, nuevo_valor, valor_anterior=None):
         """Propaga una edición hecha en la tabla (que puede estar mostrando
         self.filtered_df) de vuelta al DataFrame maestro self.df, y refresca
         el resto de la app (stats, indicadores, frecuencias)."""
@@ -2441,7 +2477,23 @@ class HadarApp(QMainWindow):
             return
         self.df.at[row_label, col_name] = nuevo_valor
         self._cache_fechas = None   # por si la celda editada era una fecha
+        # Solo cuenta como cambio a mano si el valor de verdad cambió (Qt llama a
+        # setData también cuando se acepta la celda sin tocar nada).
+        if not self._valores_iguales(valor_anterior, nuevo_valor):
+            self.procedencia.registrar_edicion_manual(self.nombre_tabla_activa, str(col_name))
+            self._actualizar_marcas_columnas_calculadas()
         self.apply_table_filter()
+
+    @staticmethod
+    def _valores_iguales(a, b):
+        try:
+            if a is None and b is None:
+                return True
+            if a != a and b != b:   # ambos NaN
+                return True
+            return bool(a == b)
+        except Exception:
+            return str(a) == str(b)
 
     def _abrir_dialogo_nota(self):
         seleccion = self.table_view.selectionModel().currentIndex() if self.table_view.selectionModel() else None
@@ -3218,6 +3270,19 @@ class HadarApp(QMainWindow):
         self._build_subtab_linaje(tab_linaje)
         self.subtabs_narrativa.addTab(tab_linaje, "Linaje")
 
+        # "Origen" (de dónde vinieron los datos, qué se les hizo, qué columnas se
+        # calcularon) NO depende de haber generado el informe: lee la bitácora de
+        # procedencia directamente, así que está disponible apenas hay datos.
+        tab_origen = QWidget()
+        layout_origen = QVBoxLayout(tab_origen)
+        layout_origen.setContentsMargins(0, 0, 0, 0)
+        self.panel_origen = PanelOrigen(self.colors)
+        layout_origen.addWidget(self.panel_origen)
+        self.subtabs_narrativa.addTab(tab_origen, "Origen")
+        self._tab_origen = tab_origen
+        self.subtabs_narrativa.currentChanged.connect(lambda _i: self._refrescar_origen())
+        self.tabview.currentChanged.connect(lambda _i: self._refrescar_origen())
+
         self._narrativa_actualizada = False
         self._ultimas_anomalias = []
         self._anomalias_por_tabla = {}
@@ -3311,6 +3376,23 @@ class HadarApp(QMainWindow):
         # momento self.arbol_linaje todavía no existiría si esto se
         # conectara antes.
         self.spin_linaje_profundidad.valueChanged.connect(self._on_linaje_profundidad_change)
+
+    def _refrescar_origen(self):
+        """Vuelve a armar el diagrama de la sub-pestaña 'Origen' con lo que hay
+        ahora en la bitácora de procedencia. Es barato (un grafo de pocas cajas),
+        así que se rehace cada vez que se entra a la sub-pestaña, se genera
+        Narrativa o se cambia de tema; solo se dibuja si está a la vista."""
+        if not hasattr(self, "panel_origen") or not hasattr(self, "_tab_origen"):
+            return
+        if self.subtabs_narrativa.currentWidget() is not self._tab_origen:
+            return
+        if self.df is None:
+            self.panel_origen.mostrar(None, self.colors)
+            return
+        self.procedencia.podar(self.tablas)
+        eventos = self.procedencia.eventos_de_tabla(self.nombre_tabla_activa)
+        grafo = construir_grafo_origen(eventos, [str(c) for c in self.df.columns], self.indicadores)
+        self.panel_origen.mostrar(grafo, self.colors)
 
     def _actualizar_estado_linaje(self):
         """Habilita o deshabilita toda la sub-pestaña Linaje según si hay
@@ -3599,6 +3681,7 @@ class HadarApp(QMainWindow):
         self._linaje_disponible = True
         self._actualizar_estado_linaje()
         self._poblar_linaje_tras_narrativa()
+        self._refrescar_origen()
 
         # Habilita/repuebla el filtro "Anomalía" de Datos y el resumen de
         # anomalías de Frecuencias con lo recién calculado -- ambos leen
