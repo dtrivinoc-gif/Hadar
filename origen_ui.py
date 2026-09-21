@@ -16,15 +16,15 @@ panel guarda referencias duras a cajas y flechas (self._cajas / self._aristas).
 import html
 
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QBrush, QPolygonF
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QBrush, QPolygonF
 from PySide6.QtWidgets import (
-    QGraphicsItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QGraphicsItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton,
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .config import COLOR_ACCENT, COLOR_ACCENT_3
 from .origen_grafo import (
-    NODO_ORIGEN, NODO_LIMPIEZA, NODO_MANOS, NODO_CALCULADA, NODO_INDICADOR,
+    NODO_ORIGEN, NODO_LIMPIEZA, NODO_MANOS, NODO_UNION, NODO_CALCULADA, NODO_INDICADOR,
 )
 
 ANCHO_CAJA = 156
@@ -45,6 +45,7 @@ _COLOR_POR_TIPO = {
     NODO_ORIGEN: COLOR_ORIGEN,
     NODO_LIMPIEZA: COLOR_PASOS,
     NODO_MANOS: COLOR_PASOS,
+    NODO_UNION: COLOR_PASOS,
     NODO_CALCULADA: COLOR_CALCULADAS,
     NODO_INDICADOR: COLOR_CALCULADAS,
 }
@@ -163,6 +164,51 @@ class _AristaOrigen(QGraphicsItem):
         painter.drawPolygon(self._cabeza)
 
 
+def _construir_escena(grafo, colors, al_hacer_clic, escena=None):
+    """Arma la escena (cajas + flechas) de un grafo, en `escena` si se pasa una (el panel
+    interactivo) o en una nueva (el render a imagen del informe). Devuelve
+    (escena, {id: caja}, [(desde, hasta, flecha)]); quien la llame debe guardar esas
+    referencias mientras use la escena."""
+    if escena is None:
+        escena = QGraphicsScene()
+    cajas, aristas = {}, []
+    for n in grafo.nodos:
+        caja = _CajaOrigen(n, colors, al_hacer_clic)
+        caja.setPos(n.capa * (ANCHO_CAJA + SEPARACION_X), n.fila * (ALTO_CAJA + SEPARACION_Y))
+        escena.addItem(caja)
+        cajas[n.id] = caja
+    for a in grafo.aristas:
+        ca, cb = cajas[a.desde], cajas[a.hasta]
+        desde = ca.pos() + QPointF(ANCHO_CAJA, ALTO_CAJA / 2)
+        hasta = cb.pos() + QPointF(0, ALTO_CAJA / 2)
+        flecha = _AristaOrigen(desde, hasta, colors)
+        escena.addItem(flecha)
+        aristas.append((a.desde, a.hasta, flecha))
+    escena.setSceneRect(escena.itemsBoundingRect().adjusted(-30, -30, 30, 30))
+    return escena, cajas, aristas
+
+
+def render_imagen_grafo(grafo, colors, ancho_max_px=1800):
+    """Dibuja el grafo en una imagen (para el informe de Narrativa y su PDF), sin
+    mostrar nada en pantalla. Devuelve (QImage, ancho_natural, alto_natural): el
+    tamaño natural es el del diagrama al 100 %; la imagen se genera al doble (o
+    menos, si es muy ancha) para que se vea nítida al achicarla. Devuelve None si
+    el grafo está vacío."""
+    if grafo is None or not grafo.nodos:
+        return None
+    escena, cajas, aristas = _construir_escena(grafo, colors, lambda _id: None)
+    rect = escena.itemsBoundingRect().adjusted(-16, -16, 16, 16)
+    escala = min(2.0, ancho_max_px / rect.width())
+    imagen = QImage(max(1, int(rect.width() * escala)), max(1, int(rect.height() * escala)),
+                    QImage.Format_ARGB32)
+    imagen.fill(QColor(colors["bg"]))
+    pintor = QPainter(imagen)
+    pintor.setRenderHint(QPainter.Antialiasing)
+    escena.render(pintor, QRectF(0, 0, imagen.width(), imagen.height()), rect)
+    pintor.end()
+    return imagen, rect.width(), rect.height()
+
+
 class _VistaOrigen(QGraphicsView):
     """QGraphicsView con zoom por rueda y arrastre del lienzo."""
 
@@ -201,6 +247,7 @@ class PanelOrigen(QWidget):
         self._aristas = []     # [(desde, hasta, _AristaOrigen)]
         self._seleccion = None
         self._auto_ajuste = True
+        self._anomalias = []   # [{"etiqueta": str, "columnas": [str]}] de la última Narrativa
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -224,6 +271,19 @@ class PanelOrigen(QWidget):
         self.btn_mas.clicked.connect(lambda: self.vista.zoom(1.25))
         self.btn_ajustar.clicked.connect(self.ajustar)
         layout.addLayout(barra)
+
+        # "Ver desde una anomalía": la pregunta inversa a tocar una caja -- una columna
+        # está mal, ¿qué la pudo causar y qué más se afecta?
+        fila_anomalia = QHBoxLayout()
+        lbl_anomalia = QLabel("Ver desde una anomalía:")
+        lbl_anomalia.setObjectName("muted")
+        fila_anomalia.addWidget(lbl_anomalia)
+        self.combo_anomalias = QComboBox()
+        self.combo_anomalias.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_anomalias.setMinimumContentsLength(28)
+        self.combo_anomalias.currentIndexChanged.connect(self._on_anomalia_elegida)
+        fila_anomalia.addWidget(self.combo_anomalias, stretch=1)
+        layout.addLayout(fila_anomalia)
 
         self.escena = QGraphicsScene()
         self.vista = _VistaOrigen(self.escena, self._zoom_manual)
@@ -249,6 +309,7 @@ class PanelOrigen(QWidget):
         self.escena.clear()
         self._cajas = {}
         self._aristas = []
+        self._reiniciar_combo_anomalias()
         self.vista.setBackgroundBrush(QBrush(QColor(self.colors["bg"])))
         self.detalle.setStyleSheet(
             f"QTextBrowser {{ background: {self.colors['card']}; color: {self.colors['text']}; "
@@ -263,19 +324,9 @@ class PanelOrigen(QWidget):
             ))
             return
 
-        for n in grafo.nodos:
-            caja = _CajaOrigen(n, self.colors, self._seleccionar)
-            caja.setPos(n.capa * (ANCHO_CAJA + SEPARACION_X), n.fila * (ALTO_CAJA + SEPARACION_Y))
-            self.escena.addItem(caja)
-            self._cajas[n.id] = caja
-        for a in grafo.aristas:
-            ca, cb = self._cajas[a.desde], self._cajas[a.hasta]
-            desde = ca.pos() + QPointF(ANCHO_CAJA, ALTO_CAJA / 2)
-            hasta = cb.pos() + QPointF(0, ALTO_CAJA / 2)
-            flecha = _AristaOrigen(desde, hasta, self.colors)
-            self.escena.addItem(flecha)
-            self._aristas.append((a.desde, a.hasta, flecha))
-        self.escena.setSceneRect(self.escena.itemsBoundingRect().adjusted(-30, -30, 30, 30))
+        _e, self._cajas, self._aristas = _construir_escena(
+            grafo, self.colors, self._seleccionar, escena=self.escena
+        )
 
         c = grafo.cuenta_por_grupo()
         partes = [
@@ -284,7 +335,7 @@ class PanelOrigen(QWidget):
             (COLOR_CALCULADAS, f"Calculadas e indicadores ({c['calculadas']})"),
         ]
         if c["ojo"]:
-            partes.append((COLOR_OJO, f"Ojo: puede estar desactualizado ({c['ojo']})"))
+            partes.append((COLOR_OJO, f"Ojo: conviene revisar ({c['ojo']})"))
         self.lbl_leyenda.setText("&nbsp;&nbsp;".join(
             f"<span style='color:{col}'>&#9632;</span> <span style='color:{self.colors['muted']}'>{txt}</span>"
             for col, txt in partes
@@ -299,6 +350,9 @@ class PanelOrigen(QWidget):
     def _seleccionar(self, nid):
         if self._grafo is None:
             return
+        self.combo_anomalias.blockSignals(True)
+        self.combo_anomalias.setCurrentIndex(0)      # tocar una caja sale del modo "desde una anomalía"
+        self.combo_anomalias.blockSignals(False)
         self._seleccion = None if nid == self._seleccion else nid
         actual = self._seleccion
         if actual:
@@ -324,6 +378,88 @@ class PanelOrigen(QWidget):
         else:
             self.detalle.setHtml(self._html_detalle(self._grafo.nodo(actual), arriba, abajo, afectada_por))
 
+    # ------------------------------------------------------------- anomalías
+    def set_anomalias(self, entradas):
+        """entradas: [{'etiqueta': texto, 'columnas': [nombres]}] (una por anomalía o grupo
+        de anomalías de la última Narrativa). Solo cuentan las que tienen columnas."""
+        self._anomalias = [e for e in (entradas or []) if e.get("columnas")]
+        self._reiniciar_combo_anomalias()
+
+    def _reiniciar_combo_anomalias(self):
+        self.combo_anomalias.blockSignals(True)
+        self.combo_anomalias.clear()
+        if self._anomalias:
+            self.combo_anomalias.addItem("Elige una anomalía…")
+            for e in self._anomalias:
+                self.combo_anomalias.addItem(e["etiqueta"])
+            self.combo_anomalias.setEnabled(True)
+        else:
+            self.combo_anomalias.addItem("Genera Narrativa para ver aquí las anomalías")
+            self.combo_anomalias.setEnabled(False)
+        self.combo_anomalias.setCurrentIndex(0)
+        self.combo_anomalias.blockSignals(False)
+
+    def _on_anomalia_elegida(self, indice):
+        if self._grafo is None:
+            return
+        if indice <= 0:
+            self._limpiar_resaltado()
+            self.detalle.setHtml(self._html_mensaje(
+                "Toca una caja para ver de dónde viene y a qué puede afectar."
+            ))
+            return
+        entrada = self._anomalias[indice - 1]
+        causas, afectados = self._grafo.impacto_anomalia(entrada["columnas"])
+        self._seleccion = None
+        en_juego = set(causas) | set(afectados)
+        for k, caja in self._cajas.items():
+            caja.seleccionada = False
+            caja.setOpacity(1.0 if k in en_juego else 0.3)
+            caja.update()
+        for desde, hasta, flecha in self._aristas:
+            flecha.setOpacity(1.0 if (desde in en_juego and hasta in en_juego) else 0.2)
+        self.detalle.setHtml(self._html_anomalia(entrada, causas, afectados))
+
+    def _limpiar_resaltado(self):
+        self._seleccion = None
+        for caja in self._cajas.values():
+            caja.seleccionada = False
+            caja.setOpacity(1.0)
+            caja.update()
+        for _d, _h, flecha in self._aristas:
+            flecha.setOpacity(1.0)
+
+    def _html_anomalia(self, entrada, causas, afectados):
+        c = self.colors
+        esc = html.escape
+        cols = ", ".join(entrada["columnas"])
+        partes = [
+            f"<p style='margin:0 0 4px 0'><b style='font-size:13px'>{esc(entrada['etiqueta'])}</b></p>",
+            f"<p style='margin:2px 0;color:{c['muted']}'>Columnas: {esc(cols)}.</p>",
+        ]
+        if causas:
+            detalle = "; ".join(
+                f"{esc(self._grafo.nodo(i).titulo)} ({esc(self._grafo.nodo(i).subtitulo)})" for i in causas
+            )
+            partes.append(f"<p style='margin:2px 0'><span style='color:{COLOR_OJO_TEXTO}'>Posible causa:</span> "
+                          f"pasos que ya tocaron esos datos: {detalle}.</p>")
+        else:
+            partes.append(f"<p style='margin:2px 0;color:{c['muted']}'>Ningún paso registrado en Hadar tocó "
+                          f"esos datos: el problema probablemente viene tal cual del origen.</p>")
+        if afectados:
+            partes.append(f"<p style='margin:2px 0'><span style='color:{c['muted']}'>Puede afectar a:</span> "
+                          f"{esc(self._titulos(afectados))}. Si corriges la columna, conviene volver a crear "
+                          f"las calculadas.</p>")
+        else:
+            partes.append(f"<p style='margin:2px 0;color:{c['muted']}'>No hay columnas calculadas ni "
+                          f"indicadores que salgan de esas columnas.</p>")
+        return f"<div style='color:{c['text']}'>" + "".join(partes) + "</div>"
+
+    def _anomalias_de(self, nodo):
+        """Etiquetas de las anomalías detectadas en columnas relacionadas con `nodo`."""
+        cols = set(nodo.columnas)
+        return [e["etiqueta"] for e in self._anomalias if cols & set(e["columnas"])]
+
     def _titulos(self, ids):
         return ", ".join(self._grafo.nodo(i).titulo for i in ids)
 
@@ -339,6 +475,13 @@ class PanelOrigen(QWidget):
                 )
             else:
                 partes.append(f"<p style='margin:2px 0;color:{c['muted']}'>{esc(linea)}</p>")
+        relacionadas = self._anomalias_de(nodo)
+        if relacionadas:
+            extra = f" y {len(relacionadas) - 4} más" if len(relacionadas) > 4 else ""
+            partes.append(
+                f"<p style='margin:2px 0;color:{c['muted']}'>Anomalías detectadas en sus columnas: "
+                f"{esc('; '.join(relacionadas[:4]))}{extra}.</p>"
+            )
         viene = esc(self._titulos(arriba)) if arriba else "es el punto de partida"
         afecta = esc(self._titulos(abajo)) if abajo else "no alimenta a nada más"
         partes.append(

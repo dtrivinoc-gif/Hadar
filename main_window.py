@@ -1431,7 +1431,9 @@ class HadarApp(QMainWindow):
         nueva_df = nueva_df[list(self.df.columns)]
         self.df = pd.concat([self.df, nueva_df], ignore_index=True)
         self._sincronizar_tabla_activa()
-        self.procedencia.registrar_hoja_unida(self.nombre_tabla_activa, elegida, filas=len(self.df))
+        self.procedencia.registrar_hoja_unida(
+            self.nombre_tabla_activa, elegida, filas=len(self.df), filas_agregadas=len(nueva_df),
+        )
         self.filtro_grafico = None
         self._resetear_filtro_anomalias()
         self.excel_hojas_activas = self.excel_hojas_activas + [elegida]
@@ -3392,7 +3394,31 @@ class HadarApp(QMainWindow):
         self.procedencia.podar(self.tablas)
         eventos = self.procedencia.eventos_de_tabla(self.nombre_tabla_activa)
         grafo = construir_grafo_origen(eventos, [str(c) for c in self.df.columns], self.indicadores)
+        self.panel_origen.set_anomalias(self._entradas_anomalias_para_origen())
         self.panel_origen.mostrar(grafo, self.colors)
+
+    def _entradas_anomalias_para_origen(self):
+        """Anomalías de la última Narrativa, agrupadas por tipo + columnas (las de
+        quiebre de patrón vienen una por fila; acá se juntan), para el selector
+        'Ver desde una anomalía' del diagrama de Origen."""
+        anomalias = getattr(self, "_ultimas_anomalias", None) or []
+        grupos = {}
+        for a in anomalias:
+            columnas = [str(c) for c in (a.get("columnas") or [])]
+            if not columnas:
+                continue
+            clave = (a.get("tipo"), tuple(columnas), a.get("contexto"))
+            grupos.setdefault(clave, 0)
+            grupos[clave] += 1
+        entradas = []
+        for (tipo, columnas, contexto), n in grupos.items():
+            etiqueta = f"{ETIQUETAS_TIPO_ANOMALIA.get(tipo, tipo)} · {', '.join(columnas)}"
+            if contexto:
+                etiqueta += f" ({contexto})"
+            if n > 1:
+                etiqueta += f" · {n} casos"
+            entradas.append({"etiqueta": etiqueta, "columnas": list(columnas)})
+        return entradas
 
     def _actualizar_estado_linaje(self):
         """Habilita o deshabilita toda la sub-pestaña Linaje según si hay

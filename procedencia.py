@@ -19,6 +19,9 @@ Etapa 3: qué se le hizo a los datos dentro de Hadar (limpieza sugerida y
 cambios a mano en Datos), y el aviso de columnas calculadas que pudieron
 quedar desactualizadas porque después se modificaron los datos de los que salen.
 
+Etapa 4: unión de hojas (las filas que entran después de limpiar no pasaron por
+esa limpieza) y ayudas para cruzar anomalías con la historia de una columna.
+
 Convención: en los eventos de limpieza y de edición a mano, `depende_de` son
 las columnas cuyos VALORES se modificaron.
 """
@@ -33,6 +36,7 @@ TIPO_COLUMNA_CALCULADA = "columna_calculada"
 TIPO_ARCHIVO_ORIGEN = "archivo_origen"
 TIPO_LIMPIEZA = "limpieza"
 TIPO_EDICION_MANUAL = "edicion_manual"
+TIPO_UNION_HOJA = "union_hoja"
 # Los eventos de estos tipos cambian VALORES de columnas ya existentes (a
 # diferencia de eliminar filas duplicadas, que no altera lo que dice cada fila).
 TIPOS_QUE_MODIFICAN_VALORES = (TIPO_LIMPIEZA, TIPO_EDICION_MANUAL)
@@ -122,6 +126,12 @@ def _descripcion_limpieza(subtipo, detalle):
     if celdas:
         base += f" — {_columnas_con_conteo(celdas)}"
     return base + "."
+
+
+def _descripcion_union(detalle):
+    n = detalle.get("filas_agregadas")
+    mas = "" if n is None else (" (1 fila más)" if n == 1 else f" ({n:,} filas más)")
+    return f"Se unió la hoja «{detalle.get('hoja', '?')}»{mas}."
 
 
 def _descripcion_edicion_manual(columna, detalle):
@@ -256,6 +266,91 @@ def evento_de_origen(eventos):
 
 def usa_su_propio_valor_anterior(evento):
     return evento.columna is not None and evento.columna in evento.depende_de
+
+
+def pasos_previos_a(eventos, evento):
+    """Limpiezas y cambios a mano (y otras uniones) hechos ANTES de `evento`."""
+    return [
+        e for e in eventos
+        if e is not evento and e.fecha and evento.fecha and e.fecha < evento.fecha
+        and e.tipo in (TIPO_LIMPIEZA, TIPO_EDICION_MANUAL, TIPO_UNION_HOJA)
+    ]
+
+
+def aviso_de_union(evento, eventos):
+    """Si la hoja se unió DESPUÉS de haber limpiado o editado la tabla, sus filas
+    no pasaron por esos pasos. Devuelve la frase de aviso, o '' si no aplica."""
+    if evento.tipo != TIPO_UNION_HOJA:
+        return ""
+    previos = [e for e in pasos_previos_a(eventos, evento) if e.tipo in (TIPO_LIMPIEZA, TIPO_EDICION_MANUAL)]
+    if not previos:
+        return ""
+    n = evento.detalle.get("filas_agregadas")
+    filas = "Esas filas" if n is None else ("Esa fila" if n == 1 else f"Esas {n:,} filas")
+    return (f"{filas} entraron después de la limpieza y de los cambios a mano anteriores, así que no "
+            f"pasaron por ellos. Conviene revisarlas o volver a aplicar la limpieza.")
+
+
+def columnas_de_origen(eventos, columna):
+    """Todas las columnas de las que sale `columna` (directas, intermedias calculadas
+    y de partida), sin contar a la propia columna. Se protege de ciclos."""
+    vistas, pendientes = [], [columna]
+    while pendientes:
+        actual = pendientes.pop()
+        ev = evento_de_columna(eventos, actual)
+        if ev is None:
+            continue
+        for d in ev.depende_de:
+            if d != columna and d not in vistas:
+                vistas.append(d)
+                pendientes.append(d)
+    return vistas
+
+
+_ETIQUETA_CORTA_LIMPIEZA = {
+    "duplicado": "eliminación de filas duplicadas",
+    "espacio_en_blanco": "recorte de espacios",
+    "formato_inconsistente": "unificación de formato",
+    "caracter_especial": "quitar caracteres especiales",
+    "numero_en_texto": "paso de texto a número",
+}
+
+
+def etiqueta_corta_de_paso(evento):
+    """'recorte de espacios', '2 cambios a mano', ... (para frases cortas)."""
+    if evento.tipo == TIPO_LIMPIEZA:
+        return _ETIQUETA_CORTA_LIMPIEZA.get(evento.detalle.get("subtipo"), "corrección de limpieza")
+    if evento.tipo == TIPO_EDICION_MANUAL:
+        n = evento.detalle.get("cambios", 0)
+        return "1 cambio a mano" if n == 1 else f"{n:,} cambios a mano"
+    return "unión de hojas"
+
+
+def impacto_de_columnas(eventos, columnas):
+    """Cruza columnas (típicamente las de una anomalía) con la historia de la tabla:
+      - 'calculadas_afectadas': columnas calculadas que salen (directa o
+        indirectamente) de ellas -- si se corrigen, hay que volver a crearlas;
+      - 'son_calculadas': [(columna, fórmula, columnas_de_partida)] si alguna de
+        ellas la calculó Hadar (el problema puede venir de más atrás);
+      - 'pasos_previos': limpiezas y cambios a mano que tocaron sus valores.
+    Todo sale de la bitácora; no infiere nada que no se haya anotado."""
+    cols = {str(c) for c in (columnas or [])}
+    calculadas = [e for e in eventos if e.tipo == TIPO_COLUMNA_CALCULADA]
+    afectadas = [
+        e.columna for e in calculadas
+        if e.columna not in cols and (set(columnas_de_origen(eventos, e.columna)) & cols)
+    ]
+    son_calculadas = []
+    for e in calculadas:
+        if e.columna in cols:
+            formula = e.detalle.get("formula_texto") or expresion_a_texto_amigable(e.detalle.get("expresion", ""))
+            son_calculadas.append((e.columna, formula, resolver_columnas_base(eventos, e.columna)))
+    pasos = sorted(
+        (e for e in eventos
+         if e.tipo in (TIPO_LIMPIEZA, TIPO_EDICION_MANUAL) and set(e.depende_de) & cols),
+        key=lambda e: e.fecha or "",
+    )
+    return {"calculadas_afectadas": afectadas, "son_calculadas": son_calculadas, "pasos_previos": pasos}
 
 
 def estado_de_actualizacion(eventos, columna, _visitando=None):
@@ -415,16 +510,24 @@ class BitacoraProcedencia:
         origen.detalle["columnas"] = columnas
         return True
 
-    def registrar_hoja_unida(self, tabla, hoja, filas=None):
-        """Se unió otra hoja del mismo Excel a la tabla (más filas)."""
+    def registrar_hoja_unida(self, tabla, hoja, filas=None, filas_agregadas=None, fecha=None):
+        """Se unió otra hoja del mismo Excel a la tabla (más filas). Actualiza el
+        origen (hojas unidas, filas) y deja un evento propio en la cadena de pasos,
+        con su fecha: las filas que entran acá NO pasaron por lo que se hizo antes
+        (limpiezas, cambios a mano), y el informe y el diagrama lo avisan."""
+        fecha = fecha or _ahora_iso()
         origen = evento_de_origen(self.eventos_de_tabla(tabla))
-        if origen is None:
-            return False
-        unidas = origen.detalle.setdefault("hojas_unidas", [])
-        if hoja not in unidas:
-            unidas.append(hoja)
-        origen.detalle["filas"] = filas
-        return True
+        if origen is not None:
+            unidas = origen.detalle.setdefault("hojas_unidas", [])
+            if hoja not in unidas:
+                unidas.append(hoja)
+            origen.detalle["filas"] = filas
+        detalle = {"hoja": hoja, "filas_agregadas": filas_agregadas, "filas_despues": filas}
+        self._eventos.append(EventoProcedencia(
+            tipo=TIPO_UNION_HOJA, tabla=tabla, columna=None, depende_de=[],
+            descripcion=_descripcion_union(detalle), fecha=fecha, detalle=detalle,
+        ))
+        return origen is not None
 
     def completar_origen_desde_fuentes(self, tablas, fuentes):
         """Proyectos guardados antes de llevar este registro: para cada tabla

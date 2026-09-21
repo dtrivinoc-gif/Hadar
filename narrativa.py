@@ -21,8 +21,9 @@ from .regimen import detectar_quiebres_de_comportamiento
 from .procedencia import (
     TIPO_COLUMNA_CALCULADA, evento_de_columna, evento_de_origen, resolver_columnas_base,
     usa_su_propio_valor_anterior, expresion_a_texto_amigable, fecha_legible, _nombre_de_fuente,
-    TIPO_LIMPIEZA, TIPO_EDICION_MANUAL, estado_de_actualizacion, frase_desactualizacion,
+    TIPO_LIMPIEZA, TIPO_EDICION_MANUAL, TIPO_UNION_HOJA, estado_de_actualizacion, frase_desactualizacion,
     FRASE_OPERACION_INDICADOR as _FRASE_OPERACION_INDICADOR,
+    aviso_de_union, impacto_de_columnas, etiqueta_corta_de_paso,
 )
 
 class QuestionAssistant:
@@ -186,7 +187,7 @@ def _frase_valor_quiebre(anomalia, valor_tipico):
     return f"la fila {fila + 1} llegó a {valor:,.2f}"
 
 
-def _bloque_quiebre_grupo(anomalias_col, df, modo_impresion, indicadores=None):
+def _bloque_quiebre_grupo(anomalias_col, df, modo_impresion, indicadores=None, eventos=None):
     """Arma un único bloque HTML para todas las anomalías de quiebre_patron
     de una misma columna: una frase que resume todas las filas afectadas, y
     la severidad/recurrencia/sugerencia mostradas UNA sola vez (tomando la
@@ -223,6 +224,7 @@ def _bloque_quiebre_grupo(anomalias_col, df, modo_impresion, indicadores=None):
     coincidencias_html = "".join(_linea_coincidencias_html(a, df) for a in anomalias_col)
 
     indicadores_html = _linea_indicadores_html([columna], indicadores)
+    indicadores_html += _lineas_procedencia_anomalia_html([columna], eventos)
 
     sugerencia_html = f"<div class='sugerencia'>💡 {sugerir_recomendacion(peor)}</div>"
     grafico = _grafico_anomalia_narrativa(peor, df)
@@ -266,6 +268,32 @@ def _linea_indicadores_html(columnas, indicadores):
         return ""
     lista = ", ".join(f"'{n}'" for n in afectados)
     return f"<div class='frase-memoria'>Esto afecta a tus indicadores: {lista}.</div>"
+
+
+def _lineas_procedencia_anomalia_html(columnas, eventos):
+    """Cruza una anomalía con la historia de sus columnas (procedencia.py): si la columna
+    la calculó Hadar (y de dónde puede venir el problema), por qué pasos ya pasaron esos
+    datos, y qué columnas calculadas salen de ella (habría que volver a crearlas si se
+    corrige). Solo dice lo que está anotado; sin eventos no muestra nada."""
+    if not columnas or not eventos:
+        return ""
+    imp = impacto_de_columnas(eventos, columnas)
+    lineas = []
+    for col, formula, base in imp["son_calculadas"]:
+        desde = f" Si el dato está mal, puede venir de: {', '.join(base)}." if base else ""
+        lineas.append(f"«{col}» es una columna que calculó Hadar (= {formula}).{desde}")
+    if imp["pasos_previos"]:
+        etiquetas = []
+        for e in imp["pasos_previos"]:
+            et = etiqueta_corta_de_paso(e)
+            if et not in etiquetas:
+                etiquetas.append(et)
+        lineas.append("Antes de esto, esos datos pasaron por: " + ", ".join(etiquetas) + ".")
+    if imp["calculadas_afectadas"]:
+        lista = ", ".join(f"«{c}»" for c in imp["calculadas_afectadas"])
+        lineas.append(f"Hay columnas calculadas que salen de esta: {lista}. "
+                      f"Si la corriges, conviene volver a crearlas.")
+    return "".join(f"<div class='frase-memoria'>{html.escape(l)}</div>" for l in lineas)
 
 
 def _linea_impacto_html(anomalia):
@@ -695,8 +723,41 @@ class NarrativeGenerator:
             f"{detalle_html}</div>"
         )
 
+    def _diagrama_origen_html(self):
+        """El mismo diagrama de la sub-pestaña «Origen», como imagen (así también sale
+        en el PDF). Solo si tiene al menos 3 cajas (con menos no aporta nada). Si algo
+        falla (sin soporte gráfico, etc.) simplemente no se muestra: el texto de abajo
+        sigue contando lo mismo."""
+        try:
+            from .config import THEMES
+            from .origen_grafo import construir_grafo_origen
+            from .origen_ui import render_imagen_grafo
+            grafo = construir_grafo_origen(
+                self.eventos_procedencia, [str(c) for c in self.df.columns], self.indicadores
+            )
+            if len(grafo.nodos) < 3:
+                return ""
+            resultado = render_imagen_grafo(grafo, THEMES["light"])
+            if resultado is None:
+                return ""
+            imagen, ancho, _alto = resultado
+            mostrado = int(min(ancho, 520 if self.modo_impresion else 640))
+            pie = (
+                "<p class='pendiente'>Cada flecha va de lo que alimenta a lo que sale de ello. "
+                "Gris: de dónde vinieron los datos. Verde azulado: lo que se les hizo. "
+                "Morado: columnas calculadas e indicadores. «Ojo»: conviene revisar.</p>"
+            )
+            if not self.modo_impresion:
+                pie += (
+                    "<p class='pendiente'>Para ver el detalle de cada caja y a qué puede afectar, "
+                    "usa la sub-pestaña «Origen».</p>"
+                )
+            return f"<div><img src=\"{_imagen_qt_a_data_uri(imagen)}\" width=\"{mostrado}\"></div>{pie}"
+        except Exception:
+            return ""
+
     @staticmethod
-    def _origen_hechos_html(hechos):
+    def _origen_hechos_html(hechos, eventos=()):
         """'Qué se le hizo a los datos': las correcciones de Limpieza sugerida y
         los cambios a mano, en orden. Cada línea sale de lo que se anotó al
         aplicarla (comparando antes y después), no de una suposición."""
@@ -710,6 +771,9 @@ class NarrativeGenerator:
                     f" La tabla pasó de {e.detalle.get('filas_antes', 0):,} "
                     f"a {e.detalle.get('filas_despues', 0):,} filas."
                 )
+            elif e.tipo == TIPO_UNION_HOJA:
+                aviso = aviso_de_union(e, eventos)
+                extra = f" Ojo: {aviso}" if aviso else ""
             prefijo = f"<b>{esc(fecha)}</b> · " if fecha else ""
             items.append(f"<li>{prefijo}{esc(e.descripcion)}{esc(extra)}</li>")
         return (
@@ -736,7 +800,7 @@ class NarrativeGenerator:
         hechos = sorted(
             (
                 e for e in self.eventos_procedencia
-                if e.tipo == TIPO_LIMPIEZA
+                if e.tipo in (TIPO_LIMPIEZA, TIPO_UNION_HOJA)
                 or (e.tipo == TIPO_EDICION_MANUAL and e.columna in self.df.columns)
             ),
             key=lambda e: e.fecha or "",
@@ -745,9 +809,9 @@ class NarrativeGenerator:
             return None
 
         esc = html.escape
-        partes = [self._origen_fuente_html(origen)]
+        partes = [self._diagrama_origen_html(), self._origen_fuente_html(origen)]
         if hechos:
-            partes.append(self._origen_hechos_html(hechos))
+            partes.append(self._origen_hechos_html(hechos, self.eventos_procedencia))
 
         if calculadas:
             bloques = []
@@ -841,7 +905,7 @@ class NarrativeGenerator:
                 if tipo_entrada == "quiebre_grupo":
                     clase, cuerpo_html = _bloque_quiebre_grupo(
                         valor, self.df, modo_impresion=self.modo_impresion,
-                        indicadores=self.indicadores,
+                        indicadores=self.indicadores, eventos=self.eventos_procedencia,
                     )
                     items.append(f"<div class='{clase}'>{cuerpo_html}</div>")
                     continue
@@ -863,6 +927,7 @@ class NarrativeGenerator:
                 coincidencia_html = _linea_coincidencias_html(a, self.df)
 
                 indicadores_html = _linea_indicadores_html(a.get("columnas"), self.indicadores)
+                indicadores_html += _lineas_procedencia_anomalia_html(a.get("columnas"), self.eventos_procedencia)
 
                 sugerencia_html = f"<div class='sugerencia'>💡 {sugerir_recomendacion(a)}</div>"
 

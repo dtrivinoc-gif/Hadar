@@ -27,8 +27,8 @@ La redacción de los detalles repite a propósito la del capítulo de Narrativa
 from dataclasses import dataclass, field
 
 from .procedencia import (
-    TIPO_COLUMNA_CALCULADA, TIPO_LIMPIEZA, TIPO_EDICION_MANUAL,
-    FRASE_OPERACION_INDICADOR,
+    TIPO_COLUMNA_CALCULADA, TIPO_LIMPIEZA, TIPO_EDICION_MANUAL, TIPO_UNION_HOJA,
+    FRASE_OPERACION_INDICADOR, aviso_de_union, columnas_de_origen,
     evento_de_origen, evento_de_columna, resolver_columnas_base, usa_su_propio_valor_anterior,
     estado_de_actualizacion, esta_desactualizada, frase_desactualizacion,
     expresion_a_texto_amigable, fecha_legible, _nombre_de_fuente,
@@ -37,6 +37,7 @@ from .procedencia import (
 NODO_ORIGEN = "origen"
 NODO_LIMPIEZA = "limpieza"
 NODO_MANOS = "manos"
+NODO_UNION = "union"
 NODO_CALCULADA = "calculada"
 NODO_INDICADOR = "indicador"
 
@@ -48,9 +49,10 @@ class NodoOrigen:
     titulo: str
     subtitulo: str
     detalle: list = field(default_factory=list)   # líneas en lenguaje llano para el panel
-    ojo: bool = False            # puede estar desactualizado
+    ojo: bool = False            # conviene revisarlo (desactualizado, filas sin limpiar...)
     capa: int = 0                # columna del diagrama (0 = más a la izquierda)
     fila: int = 0
+    columnas: list = field(default_factory=list)   # columnas cuyos datos toca o de las que sale
 
 
 @dataclass
@@ -107,13 +109,28 @@ class GrafoOrigen:
         fuentes = {a.desde for a in self.aristas_ojo if a.hasta in base}
         return [n.id for n in self.nodos if n.id in fuentes]
 
+    def impacto_anomalia(self, columnas):
+        """Dadas las columnas de una anomalía: (causas, afectados) como listas de ids.
+        causas: pasos (limpieza / cambios a mano) que tocaron datos de esas columnas.
+        afectados: columnas calculadas e indicadores que salen de ellas (incluidos los
+        que dependen de esos, siguiendo las flechas)."""
+        cols = {str(c) for c in (columnas or [])}
+        causas = [n.id for n in self.nodos if n.tipo in (NODO_LIMPIEZA, NODO_MANOS) and set(n.columnas) & cols]
+        directos = [n.id for n in self.nodos if n.tipo in (NODO_CALCULADA, NODO_INDICADOR) and set(n.columnas) & cols]
+        afectados = list(directos)
+        for d in directos:
+            for x in self.descendientes(d):
+                if x not in afectados:
+                    afectados.append(x)
+        return causas, afectados
+
     def cuenta_por_grupo(self):
         """Para la leyenda: {'origen': n, 'pasos': n, 'calculadas': n, 'ojo': n}."""
         c = {"origen": 0, "pasos": 0, "calculadas": 0, "ojo": 0}
         for n in self.nodos:
             if n.tipo == NODO_ORIGEN:
                 c["origen"] += 1
-            elif n.tipo in (NODO_LIMPIEZA, NODO_MANOS):
+            elif n.tipo in (NODO_LIMPIEZA, NODO_MANOS, NODO_UNION):
                 c["pasos"] += 1
             else:
                 c["calculadas"] += 1
@@ -230,7 +247,8 @@ def construir_grafo_origen(eventos, columnas, indicadores=None):
     calculadas = [e for e in eventos if e.tipo == TIPO_COLUMNA_CALCULADA and e.columna in columnas]
     pasos = sorted(
         (e for e in eventos
-         if e.tipo == TIPO_LIMPIEZA or (e.tipo == TIPO_EDICION_MANUAL and e.columna in columnas)),
+         if e.tipo in (TIPO_LIMPIEZA, TIPO_UNION_HOJA)
+         or (e.tipo == TIPO_EDICION_MANUAL and e.columna in columnas)),
         key=lambda e: e.fecha or "",
     )
     grafo = GrafoOrigen()
@@ -246,7 +264,7 @@ def construir_grafo_origen(eventos, columnas, indicadores=None):
     grupos = []   # [(nodo, fecha_max)]
     ultimo_tipo = None
     for e in pasos:
-        tipo = NODO_LIMPIEZA if e.tipo == TIPO_LIMPIEZA else NODO_MANOS
+        tipo = {TIPO_LIMPIEZA: NODO_LIMPIEZA, TIPO_UNION_HOJA: NODO_UNION}.get(e.tipo, NODO_MANOS)
         if tipo != ultimo_tipo:
             grupos.append({"tipo": tipo, "eventos": []})
             ultimo_tipo = tipo
@@ -260,6 +278,19 @@ def construir_grafo_origen(eventos, columnas, indicadores=None):
             titulo = "Limpieza"
             subtitulo = "1 paso" if len(evs) == 1 else f"{len(evs)} pasos"
             detalle = [_linea_paso(e) for e in evs]
+        elif g["tipo"] == NODO_UNION:
+            titulo = "Unión de hojas"
+            if len(evs) == 1:
+                n_filas = evs[0].detalle.get("filas_agregadas")
+                subtitulo = (f"+{n_filas:,} filas · {evs[0].detalle.get('hoja', '')}"
+                             if n_filas is not None else str(evs[0].detalle.get("hoja", "")))
+            else:
+                subtitulo = f"{len(evs)} hojas"
+            detalle = [_linea_paso(e) for e in evs]
+            for e in evs:
+                aviso = aviso_de_union(e, eventos)
+                if aviso and f"Ojo: {aviso}" not in detalle:
+                    detalle.append(f"Ojo: {aviso}")
         else:
             titulo = "Cambios a mano"
             if len(evs) == 1:
@@ -268,8 +299,10 @@ def construir_grafo_origen(eventos, columnas, indicadores=None):
                 subtitulo = f"{len(evs)} columnas"
             detalle = [_linea_paso(e) for e in evs]
         nid = f"paso{i}"
+        tocadas = sorted({c for e in evs for c in e.depende_de})
+        con_ojo = g["tipo"] == NODO_UNION and any(aviso_de_union(e, eventos) for e in evs)
         grafo.nodos.append(NodoOrigen(id=nid, tipo=g["tipo"], titulo=titulo, subtitulo=subtitulo,
-                                      detalle=detalle, capa=i, fila=0))
+                                      detalle=detalle, capa=i, fila=0, ojo=con_ojo, columnas=tocadas))
         grafo.aristas.append(AristaOrigen(cadena[-1], nid))
         cadena.append(nid)
         fechas_max[nid] = max((e.fecha or "") for e in evs)
@@ -303,6 +336,7 @@ def construir_grafo_origen(eventos, columnas, indicadores=None):
             id=nid, tipo=NODO_CALCULADA, titulo=str(e.columna),
             subtitulo=f"de {etiquetas_sub}" if usa else "sin otras columnas",
             detalle=_detalle_calculada(e, eventos, estado), ojo=esta_desactualizada(estado),
+            columnas=[str(e.columna)] + columnas_de_origen(eventos, e.columna),
         ))
     estados_calc = {e.columna: estado_de_actualizacion(eventos, e.columna) for e in calculadas}
     for e in calculadas:
@@ -336,6 +370,7 @@ def construir_grafo_origen(eventos, columnas, indicadores=None):
         nuevos.append(NodoOrigen(
             id=nid, tipo=NODO_INDICADOR, titulo=str(getattr(ind, "nombre", "Indicador")),
             subtitulo=corta, detalle=detalle, ojo=bool(con_ojo),
+            columnas=sorted(set(deps) | {x for d in deps_calc for x in columnas_de_origen(eventos, d)}),
         ))
 
     # ---- capas (columna del diagrama), con protección contra ciclos
