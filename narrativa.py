@@ -317,12 +317,19 @@ def _linea_coincidencias_html(anomalia, df):
 # el texto, que sigue siendo la fuente de verdad.
 # ----------------------------------------------------------------------------
 def _codificar_identidad_anomalia(anomalia):
-    """Empaqueta tipo+columnas de una anomalía en un código corto para meterlo
-    en un href (`resolver:<código>`) del informe. Así el clic en "Marcar como
-    resuelta" puede viajar hasta MemoriaHadar.marcar_resuelta sin depender de
-    que el texto de la descripción se mantenga igual."""
+    """Empaqueta tipo+columnas+contexto de una anomalía en un código corto
+    para meterlo en un href (`resolver:<código>` / `falso_positivo:<código>`)
+    del informe. Así el clic en "Marcar como resuelta" o "Marcar como no es
+    una anomalía" puede viajar hasta MemoriaHadar sin depender de que el
+    texto de la descripción se mantenga igual. El contexto (ej.
+    "Producto=Jamón") distingue una categoría puntual de otra cuando la
+    anomalía viene de un chequeo segmentado -- ver anomalias.py."""
     try:
-        payload = json.dumps({"tipo": anomalia.get("tipo"), "columnas": anomalia.get("columnas") or []})
+        payload = json.dumps({
+            "tipo": anomalia.get("tipo"),
+            "columnas": anomalia.get("columnas") or [],
+            "contexto": anomalia.get("contexto"),
+        })
         return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
     except Exception:
         return None
@@ -832,7 +839,10 @@ class NarrativeGenerator:
 
                 codigo = _codificar_identidad_anomalia(a)
                 enlace_html = (
-                    f"<div class='resolver-link'><a href='resolver:{codigo}'>Marcar como resuelta</a></div>"
+                    f"<div class='resolver-link'>"
+                    f"<a href='resolver:{codigo}'>Marcar como resuelta</a>"
+                    f" · <a href='falso_positivo:{codigo}'>Marcar como no es una anomalía</a>"
+                    f"</div>"
                     if (codigo and not self.modo_impresion) else ""
                 )
 

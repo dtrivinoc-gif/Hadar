@@ -152,14 +152,28 @@ class MemoriaHadar:
                     impacto REAL
                 )
             """)
-            # Migración suave: si la tabla ya existía de antes de que
-            # existiera el impacto acumulado, le sumamos la columna sin
-            # perder el historial ya guardado.
+            # Migración suave: columnas agregadas después de la versión
+            # original de la tabla, sin perder el historial ya guardado.
             columnas_existentes = {
                 fila[1] for fila in con.execute("PRAGMA table_info(anomalias_historicas)")
             }
             if "impacto" not in columnas_existentes:
                 con.execute("ALTER TABLE anomalias_historicas ADD COLUMN impacto REAL")
+            if "contexto" not in columnas_existentes:
+                # Identifica el GRUPO específico de una anomalía segmentada
+                # (ver _elegir_columna_segmentacion en anomalias.py), ej.
+                # "Producto=Jamón" -- sin esto, "marcar como falso positivo"
+                # en una categoría (jamón) silenciaría también las anomalías
+                # de las demás categorías (pan, leche), que son un problema
+                # distinto aunque compartan tipo y columna.
+                con.execute("ALTER TABLE anomalias_historicas ADD COLUMN contexto TEXT")
+            if "falso_positivo" not in columnas_existentes:
+                # A diferencia de 'resuelta' (asume que SÍ era un problema
+                # real y ya se arregló), este flag dice "esto nunca fue una
+                # anomalía real" -- ver marcar_falso_positivo más abajo.
+                con.execute(
+                    "ALTER TABLE anomalias_historicas ADD COLUMN falso_positivo INTEGER DEFAULT 0"
+                )
             # Relaciones de orden temporal definidas a mano por el usuario para
             # este esquema de datos (ej. "aprobacion" debe ir antes que
             # "entrega"), usando los nombres de columna REALES -- no dependen
@@ -179,7 +193,8 @@ class MemoriaHadar:
     @staticmethod
     def _clave_identidad(anomalia):
         columnas = tuple(sorted(anomalia.get("columnas") or []))
-        return anomalia["tipo"], columnas
+        contexto = anomalia.get("contexto")  # ej. "Producto=Jamón" si viene segmentada
+        return anomalia["tipo"], columnas, contexto
 
     def registrar_carga(self, df, nombre_proceso=None):
         """Registra (o actualiza) que se cargó un dataset con esta
@@ -219,15 +234,15 @@ class MemoriaHadar:
         enriquecidas = []
         with _conexion_memoria(self.ruta_db) as con:
             for anomalia in anomalias_actuales:
-                tipo, columnas = self._clave_identidad(anomalia)
+                tipo, columnas, contexto = self._clave_identidad(anomalia)
                 columnas_str = ",".join(columnas)
                 impacto_actual = anomalia.get("diferencia_absoluta")
 
                 previas = con.execute(
                     "SELECT fecha_deteccion, resuelta, impacto FROM anomalias_historicas "
-                    "WHERE fingerprint = ? AND tipo = ? AND columnas = ? "
+                    "WHERE fingerprint = ? AND tipo = ? AND columnas = ? AND contexto IS ? "
                     "ORDER BY fecha_deteccion ASC",
-                    (fingerprint, tipo, columnas_str),
+                    (fingerprint, tipo, columnas_str, contexto),
                 ).fetchall()
                 ya_registrada_hoy = bool(previas) and previas[-1][0][:10] == hoy
 
@@ -287,17 +302,17 @@ class MemoriaHadar:
                 if not ya_registrada_hoy:
                     con.execute(
                         "INSERT INTO anomalias_historicas "
-                        "(fingerprint, tipo, columnas, descripcion, gravedad, fecha_deteccion, impacto) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "(fingerprint, tipo, columnas, descripcion, gravedad, fecha_deteccion, "
+                        "impacto, contexto) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (fingerprint, tipo, columnas_str, anomalia.get("descripcion", ""),
-                         anomalia.get("gravedad", "media"), ahora, impacto_actual),
+                         anomalia.get("gravedad", "media"), ahora, impacto_actual, contexto),
                     )
                 enriquecidas.append(anomalia_enriquecida)
         return enriquecidas
 
     def historial_proceso(self, fingerprint):
-        columnas_tabla = ["tipo", "columnas", "descripcion", "gravedad",
-                           "fecha_deteccion", "resuelta"]
+        columnas_tabla = ["tipo", "columnas", "contexto", "descripcion", "gravedad",
+                           "fecha_deteccion", "resuelta", "falso_positivo"]
         with _conexion_memoria(self.ruta_db) as con:
             filas = con.execute(
                 f"SELECT {', '.join(columnas_tabla)} FROM anomalias_historicas "
@@ -306,14 +321,65 @@ class MemoriaHadar:
             ).fetchall()
         return [dict(zip(columnas_tabla, fila)) for fila in filas]
 
-    def marcar_resuelta(self, fingerprint, tipo, columnas):
+    def marcar_resuelta(self, fingerprint, tipo, columnas, contexto=None):
         columnas_str = ",".join(sorted(columnas))
         with _conexion_memoria(self.ruta_db) as con:
             con.execute(
                 "UPDATE anomalias_historicas SET resuelta = 1 "
-                "WHERE fingerprint = ? AND tipo = ? AND columnas = ? AND resuelta = 0",
-                (fingerprint, tipo, columnas_str),
+                "WHERE fingerprint = ? AND tipo = ? AND columnas = ? AND contexto IS ? "
+                "AND resuelta = 0",
+                (fingerprint, tipo, columnas_str, contexto),
             )
+
+    def marcar_falso_positivo(self, fingerprint, tipo, columnas, contexto=None):
+        """Marca esta anomalía (tipo + columnas + contexto puntual, ej.
+        "Producto=Jamón" si viene de un chequeo segmentado) como que NUNCA
+        fue un problema real -- a diferencia de marcar_resuelta (que asume
+        que sí lo era y ya se arregló), esto le dice al sistema que deje de
+        mostrarla en futuros informes de este mismo proceso, sin depender
+        de que "se resuelva" nada. También se marca 'resuelta' para que
+        deje de contar en la racha de días sin resolver de esa identidad."""
+        columnas_str = ",".join(sorted(columnas))
+        with _conexion_memoria(self.ruta_db) as con:
+            con.execute(
+                "UPDATE anomalias_historicas SET falso_positivo = 1, resuelta = 1 "
+                "WHERE fingerprint = ? AND tipo = ? AND columnas = ? AND contexto IS ?",
+                (fingerprint, tipo, columnas_str, contexto),
+            )
+
+    def obtener_falsos_positivos_conocidos(self, fingerprint):
+        """(tipo, columnas, contexto) de todas las anomalías que el
+        usuario ya marcó como falso positivo para este proceso -- pensado
+        para que Narrativa las filtre ANTES de mostrarlas (ver
+        filtrar_falsos_positivos), no solo las cuente como 'resueltas'."""
+        with _conexion_memoria(self.ruta_db) as con:
+            filas = con.execute(
+                "SELECT DISTINCT tipo, columnas, contexto FROM anomalias_historicas "
+                "WHERE fingerprint = ? AND falso_positivo = 1",
+                (fingerprint,),
+            ).fetchall()
+        return {
+            (tipo, tuple(cols.split(",")) if cols else (), contexto)
+            for tipo, cols, contexto in filas
+        }
+
+    def filtrar_falsos_positivos(self, fingerprint, anomalias):
+        """Devuelve `anomalias` sin las que el usuario ya marcó como falso
+        positivo para este mismo proceso. Se llama ANTES de
+        enriquecer_con_memoria, para que ni siquiera se vuelvan a registrar
+        en el historial ni aparezcan en el informe -- ej. si ya se marcó
+        que las ventas grandes de jamón no son anomalía, no vuelven a
+        aparecer la próxima vez que se cargue este mismo tipo de datos."""
+        conocidos = self.obtener_falsos_positivos_conocidos(fingerprint)
+        if not conocidos:
+            return anomalias
+        resultado = []
+        for a in anomalias:
+            tipo, columnas, contexto = self._clave_identidad(a)
+            if (tipo, columnas, contexto) in conocidos:
+                continue
+            resultado.append(a)
+        return resultado
 
     def obtener_pares_temporales(self, fingerprint):
         """Devuelve las relaciones de orden temporal ("esta columna debe ir

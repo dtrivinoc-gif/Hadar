@@ -94,6 +94,109 @@ def _clasificar_severidad_impacto(z_abs, umbral_z):
     return "leve"
 
 
+# ---------------------------------------------------------------------------
+# Segmentación automática para el chequeo de quiebres de patrón (más abajo,
+# en _check_pattern_breaks). Antes de comparar un valor contra el resto de
+# SU COLUMNA ENTERA, se pregunta primero si existe una columna categórica
+# (ej. "Producto" en un almacén, "Proceso" en una planta, "Tipo de
+# paciente" en un hospital -- no se asume ningún nombre) que explique por
+# qué unos valores son naturalmente más grandes que otros. Si existe, cada
+# valor se compara contra lo típico DENTRO de su propia categoría: una
+# venta de $20.000 en jamón deja de marcarse como anomalía solo por ser
+# grande, si el resto de las ventas de jamón también rondan ese monto.
+# ---------------------------------------------------------------------------
+PROPORCION_MAXIMA_CATEGORIAS_SEGMENTACION = 0.3  # tope de valores distintos, como % de las filas
+MINIMO_FILAS_POR_GRUPO = 5           # bajo esto, la mediana/MAD propia del grupo no es confiable
+REDUCCION_MINIMA_DISPERSION = 0.3    # el grupo debe explicar al menos este % de la dispersión total
+COBERTURA_MINIMA_SEGMENTACION = 0.5  # al menos este % de las filas debe caer en grupos con muestra propia
+
+
+def _dispersion_relativa(mediana, mad_valor, referencia):
+    """MAD como fracción de la escala de su propio grupo (su mediana), no
+    en términos absolutos -- así una categoría de precio naturalmente más
+    alto (ej. jamón, con un MAD absoluto grande solo porque sus montos son
+    grandes) no aparenta ser "más dispersa" que una categoría barata solo
+    por la magnitud de sus números. `referencia` se usa como respaldo
+    cuando la mediana del grupo es 0 (ej. una columna que puede valer 0)."""
+    base = mediana if mediana else referencia
+    return mad_valor / base if base else mad_valor
+
+
+def _columnas_candidatas_a_segmentar(df, columna_excluida):
+    """Columnas del df que podrían explicar la variación de una columna
+    numérica: se repiten lo suficiente (no son un ID o texto libre único
+    por fila) pero no son casi constantes tampoco. No asume ningún nombre
+    de columna en particular."""
+    candidatas = []
+    total = len(df)
+    if total == 0:
+        return candidatas
+    tope = max(2, int(total * PROPORCION_MAXIMA_CATEGORIAS_SEGMENTACION))
+    for col in df.columns:
+        if col == columna_excluida:
+            continue
+        n_unicos = df[col].nunique(dropna=True)
+        if 1 < n_unicos <= tope:
+            candidatas.append(col)
+    return candidatas
+
+
+def _estadisticas_robustas_por_grupo(serie, grupos, minimo_por_grupo=MINIMO_FILAS_POR_GRUPO):
+    """Mediana y MAD de `serie` calculados POR CADA VALOR de `grupos` (una
+    columna categórica candidata). Solo se devuelven los grupos con
+    muestra suficiente -- las filas de un grupo chico no tienen una base
+    propia confiable y se manejan aparte, con las estadísticas globales
+    (ver _elegir_columna_segmentacion)."""
+    estadisticas = {}
+    for valor_grupo, sub_serie in serie.groupby(grupos):
+        if len(sub_serie) < minimo_por_grupo:
+            continue
+        mediana = sub_serie.median()
+        mad = (sub_serie - mediana).abs().median()
+        estadisticas[valor_grupo] = (mediana, mad, len(sub_serie))
+    return estadisticas
+
+
+def _elegir_columna_segmentacion(serie, df, candidatas, mediana_global, mad_global):
+    """De entre las columnas candidatas, elige la que más reduce la
+    dispersión RELATIVA de `serie` al agrupar por ella -- la que mejor
+    explica por qué unos valores son naturalmente más grandes que otros
+    (comparación en escala relativa para no descartar una categoría de
+    precio alto, como jamón, solo porque su MAD absoluto es grande).
+    Devuelve (columna_elegida, estadisticas_por_grupo) o (None, {}) si
+    ninguna candidata aporta lo suficiente; en ese caso el chequeo de más
+    abajo sigue funcionando exactamente como antes (comparación global)."""
+    if not mad_global:
+        return None, {}
+
+    dispersion_global = _dispersion_relativa(mediana_global, mad_global, mad_global)
+    mejor_columna, mejor_estadisticas, mejor_reduccion = None, {}, 0.0
+
+    for col in candidatas:
+        grupos = df.loc[serie.index, col]
+        estadisticas = _estadisticas_robustas_por_grupo(serie, grupos)
+        if not estadisticas:
+            continue
+
+        filas_cubiertas = sum(n for _, _, n in estadisticas.values())
+        cobertura = filas_cubiertas / len(serie)
+        if cobertura < COBERTURA_MINIMA_SEGMENTACION:
+            continue  # muy pocos grupos con muestra propia: no vale la pena
+
+        dispersion_ponderada = sum(
+            _dispersion_relativa(m, mad, mediana_global) * n
+            for m, mad, n in estadisticas.values()
+        ) / filas_cubiertas
+        reduccion = 1 - (dispersion_ponderada / dispersion_global) if dispersion_global else 0
+
+        if reduccion > mejor_reduccion:
+            mejor_columna, mejor_estadisticas, mejor_reduccion = col, estadisticas, reduccion
+
+    if mejor_reduccion >= REDUCCION_MINIMA_DISPERSION:
+        return mejor_columna, mejor_estadisticas
+    return None, {}
+
+
 class SemanticAnomalyDetector:
     """Detecta anomalías sin asumir el dominio del dataset:
       1. Reglas de negocio: motor listo, vacío por defecto (se completan desde
@@ -365,6 +468,17 @@ class SemanticAnomalyDetector:
         honesta de "qué es lo normal acá". El factor 0.6745 es el que hace
         que este 'z robusto' sea comparable al umbral_z de siempre bajo una
         distribución normal -- no hay que tocar el umbral por este cambio.
+
+        ANTES de comparar cada valor contra el resto de la columna entera,
+        se intenta segmentar por alguna columna categórica (ver
+        _elegir_columna_segmentacion, arriba): un valor grande pero normal
+        PARA SU CATEGORÍA (ej. una venta de $20.000 en jamón, en un
+        almacén donde el resto vende pan y cigarros de $1.000 a $5.000) deja
+        de marcarse como anomalía solo por ser grande en términos absolutos
+        -- se compara contra lo típico de esa misma categoría. Si ninguna
+        columna explica bien la dispersión, o el dataset no tiene una
+        columna categórica útil, el chequeo se comporta exactamente igual
+        que antes (comparación global).
         """
         anomalias = []
         num_cols = self.df.select_dtypes(include=[np.number]).columns
@@ -379,7 +493,30 @@ class SemanticAnomalyDetector:
             if not mad or pd.isna(mad):
                 continue  # sin variación real en la columna: no hay quiebre que buscar
 
-            z_robusto = 0.6745 * (serie - mediana) / mad
+            candidatas = _columnas_candidatas_a_segmentar(self.df, col)
+            columna_segmento, estadisticas_grupo = _elegir_columna_segmentacion(
+                serie, self.df, candidatas, mediana, mad
+            )
+
+            if columna_segmento:
+                grupos_serie = self.df.loc[serie.index, columna_segmento]
+                mapa_mediana = {g: m for g, (m, d, n) in estadisticas_grupo.items()}
+                mapa_mad = {g: d for g, (m, d, n) in estadisticas_grupo.items()}
+                # Filas cuyo grupo no tuvo muestra propia suficiente (o cuyo
+                # grupo no calzó con ninguna clave, ej. NaN) se comparan
+                # igual contra las estadísticas globales -- nunca se quedan
+                # sin chequeo por no pertenecer a un grupo "grande".
+                medianas_por_fila = grupos_serie.map(mapa_mediana).fillna(mediana)
+                mads_por_fila = grupos_serie.map(mapa_mad).fillna(mad)
+                # Un grupo con MAD 0 (todos sus propios valores idénticos)
+                # no sirve como vara de medir -- se cae al MAD global solo
+                # para esas filas puntuales.
+                mads_por_fila = mads_por_fila.mask(mads_por_fila == 0, mad)
+                z_robusto = 0.6745 * (serie - medianas_por_fila) / mads_por_fila
+            else:
+                medianas_por_fila = pd.Series(mediana, index=serie.index)
+                z_robusto = 0.6745 * (serie - mediana) / mad
+
             atipicos = z_robusto[z_robusto.abs() > self.umbral_z]
             if atipicos.empty:
                 continue
@@ -398,23 +535,36 @@ class SemanticAnomalyDetector:
                 # la fila correcta.
                 for idx, z in atipicos.items():
                     valor = serie.loc[idx]
-                    diferencia_absoluta = valor - mediana
+                    valor_tipico_fila = medianas_por_fila.loc[idx]
+                    diferencia_absoluta = valor - valor_tipico_fila
                     diferencia_porcentual = (
-                        round(diferencia_absoluta / mediana * 100, 1) if mediana else None
+                        round(diferencia_absoluta / valor_tipico_fila * 100, 1)
+                        if valor_tipico_fila else None
                     )
+                    contexto_grupo = ""
+                    contexto = None
+                    if columna_segmento:
+                        valor_grupo = self.df.loc[idx, columna_segmento]
+                        contexto_grupo = f" para {columna_segmento}='{valor_grupo}'"
+                        # Identifica el grupo puntual (ej. "Producto=Jamón") para
+                        # que memoria.py pueda recordar un "falso positivo" SOLO
+                        # para esa categoría, sin silenciar el resto -- ver
+                        # MemoriaHadar.marcar_falso_positivo.
+                        contexto = f"{columna_segmento}={valor_grupo}"
                     anomalias.append({
                         "tipo": "quiebre_patron",
                         "columnas": [col],
+                        "contexto": contexto,
                         "descripcion": (
                             f"En la fila {idx + 1}, '{col}' vale {valor:,.2f}, muy por "
                             f"{'encima' if z > 0 else 'debajo'} de lo típico "
-                            f"({mediana:,.2f})."
+                            f"({valor_tipico_fila:,.2f}{contexto_grupo})."
                         ),
                         "filas_afectadas": 1,
                         "fila_indice": idx,
                         "indices_atipicos": [idx],
                         "gravedad": "alta" if abs(z) > self.umbral_z * 1.5 else "media",
-                        "valor_tipico": mediana,
+                        "valor_tipico": valor_tipico_fila,
                         "diferencia_absoluta": diferencia_absoluta,
                         "diferencia_porcentual": diferencia_porcentual,
                         "severidad_impacto": _clasificar_severidad_impacto(abs(z), self.umbral_z),
@@ -425,14 +575,23 @@ class SemanticAnomalyDetector:
                 n_atipicos = len(atipicos)
                 porcentaje = round(n_atipicos / len(self.df) * 100, 1) if len(self.df) else 0
                 ejemplos = ", ".join(str(i + 1) for i in atipicos.index[:5])
-                anomalias.append({
-                    "tipo": "quiebre_patron",
-                    "columnas": [col],
-                    "descripcion": (
+                if columna_segmento:
+                    descripcion = (
+                        f"'{col}' tiene {n_atipicos:,} valor(es) atípico(s) "
+                        f"({porcentaje}% de las filas), muy alejados de lo típico de su "
+                        f"propio grupo (segmentado por '{columna_segmento}'). "
+                        f"Ejemplos de filas: {ejemplos}."
+                    )
+                else:
+                    descripcion = (
                         f"'{col}' tiene {n_atipicos:,} valor(es) atípico(s) "
                         f"({porcentaje}% de las filas), muy alejados de lo típico "
                         f"({mediana:,.2f}). Ejemplos de filas: {ejemplos}."
-                    ),
+                    )
+                anomalias.append({
+                    "tipo": "quiebre_patron",
+                    "columnas": [col],
+                    "descripcion": descripcion,
                     "filas_afectadas": n_atipicos,
                     "porcentaje": porcentaje,
                     "indices_atipicos": list(atipicos.index),
