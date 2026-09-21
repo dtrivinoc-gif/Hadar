@@ -12,7 +12,9 @@ entre ambos, en lenguaje natural.
 
 Modelo de recálculo (decidido por el usuario): al arrastrar el slider de
 rango, se recalculan en vivo Métricas/Indicadores/Frecuencias/Alarmas
-(son baratos, ya es lo único que hace apply_table_filter()). Las
+(son baratos, ya es lo único que hace apply_table_filter()) y también la
+vista de puntos de abajo, que muestra solo lo que cae en el período
+recortado (el histograma de arriba siempre muestra el total). Las
 anomalías NO se recalculan solas -- para eso hay un botón explícito
 "Actualizar anomalías en este rango", porque correr
 SemanticAnomalyDetector en cada pixel de arrastre puede sentirse pegado
@@ -25,11 +27,11 @@ import pandas as pd
 import pyqtgraph as pg
 
 from PySide6.QtCore import Qt, QTimer, QPoint, Signal
-from PySide6.QtGui import QColor, QPen, QCursor, QPixmap, QPainter, QAction
+from PySide6.QtGui import QColor, QPen, QCursor, QPixmap, QPainter, QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QGraphicsLineItem, QDialog, QDialogButtonBox, QMessageBox, QToolButton,
-    QMenu,
+    QMenu, QFrame, QScrollArea,
 )
 
 from .config import COLOR_ACCENT, COLOR_DANGER, DONUT_PALETTE
@@ -39,6 +41,7 @@ from .linea_tiempo import (
     construir_histograma, anomalias_con_fecha, tiene_componente_horario,
     minutos_desde_medianoche,
     formatear_duracion, resumen_duraciones,
+    detectar_formato_fecha, parsear_fechas, FormatoFecha,
 )
 
 # Debounce del slider: recalcula Métricas/Indicadores como máximo cada
@@ -49,6 +52,12 @@ _DEBOUNCE_SLIDER_MS = 120
 # Color neutro para conexiones manuales (no confundirlas con los colores
 # por columna ni por par automático).
 _COLOR_CONEXION_MANUAL = "#C9C9D6"
+
+# Radio (en píxeles de pantalla, no en unidades de dato) dentro del cual un
+# clic "acierta" un punto o una línea. En píxeles porque el zoom cambia
+# cuántas unidades de dato caben en un píxel, pero el dedo/mouse no.
+_TOLERANCIA_PUNTO_PX = 12
+_TOLERANCIA_LINEA_PX = 6
 
 
 def _epoch_a_timestamp(valor_epoch_seg):
@@ -74,61 +83,87 @@ class _MenuMultiCheck(QMenu):
         super().mouseReleaseEvent(event)
 
 
-class _PopupInfoFila(QWidget):
-    """Reemplaza el tooltip nativo para el clic sobre un punto de hito:
-    visualmente es el mismo recuadro chico y oscuro, pero no depende de que
-    el mouse se quede quieto -- un QToolTip se cierra solo con el primer
-    micro-movimiento o timeout del sistema operativo, que era justo la queja
-    ("desaparece rápido y a veces no la muestra"). Este se abre con el clic
-    y se queda hasta el próximo clic (sobre otro punto, o fuera de todos)."""
+class _PopupFlotante(QFrame):
+    """Recuadro oscuro que aparece al hacer clic en un punto o una línea.
 
-    def __init__(self):
-        super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(9, 7, 9, 7)
+    Es un widget HIJO del panel de la Línea de Tiempo, no una ventana
+    independiente. Antes era una ventana de tipo ToolTip: como cualquier
+    ventana de nivel superior, no sabe nada de las pestañas, así que al
+    cambiar a Indicadores (o a otra aplicación) quedaba flotando encima.
+    Siendo hijo del panel, se oculta solo cuando el panel deja de verse."""
+
+    _ESTILO = (
+        "#popupHadar { background-color: #2B2B36; border: 1px solid #46465A; border-radius: 6px; }"
+        "#popupHadar QLabel { color: #F0F0F0; background: transparent; border: none; }"
+        "#popupHadar QScrollArea, #popupHadar QScrollArea > QWidget > QWidget "
+        "{ background: transparent; border: none; }"
+    )
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("popupHadar")
+        self.setStyleSheet(self._ESTILO)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(9, 7, 9, 7)
+
         self._label = QLabel()
         self._label.setTextFormat(Qt.TextFormat.RichText)
-        self._label.setStyleSheet("color: #F0F0F0; background: transparent;")
-        layout.addWidget(self._label)
-        self.setStyleSheet(
-            "background-color: #2B2B36; border: 1px solid #46465A; border-radius: 6px;"
-        )
+        # Con muchas columnas la fila no cabe en el alto del panel: el
+        # texto va dentro de un área con scroll que solo aparece si hace falta.
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setWidget(self._label)
+        self._layout.addWidget(self._scroll)
+        self.hide()
 
-    def mostrar(self, texto, posicion_global):
-        self._label.setText(texto)
+    def _colocar(self, posicion_global):
+        """Junto al cursor, pero siempre dentro del panel: si no cabe a la
+        derecha o abajo, se abre hacia el otro lado (así nunca tapa el
+        punto donde se hizo clic)."""
+        padre = self.parentWidget()
+        self.setMaximumSize(max(padre.width() - 8, 120), max(padre.height() - 8, 120))
         self.adjustSize()
-        self.move(posicion_global + QPoint(16, 16))
+        cursor = padre.mapFromGlobal(posicion_global)
+        x = cursor.x() + 16
+        if x + self.width() > padre.width():
+            x = cursor.x() - 16 - self.width()
+        y = cursor.y() + 16
+        if y + self.height() > padre.height():
+            y = cursor.y() - 16 - self.height()
+        self.move(max(x, 0), max(y, 0))
         self.show()
+        self.raise_()
 
     def ocultar(self):
         self.hide()
 
 
-class _PopupConexion(QWidget):
-    """Mismo look que _PopupInfoFila, pero para el clic sobre una LÍNEA de
-    conexión: muestra la duración entre los dos puntos, y si la conexión
-    es manual, un botón para eliminarla (las automáticas no se pueden
-    eliminar una por una -- se destildan desde 'Unir fechas')."""
+class _PopupInfoFila(_PopupFlotante):
+    """Info de la fila del punto clicado. Se abre con el clic y se queda
+    hasta el próximo clic (sobre otro punto, o sobre el vacío del gráfico)
+    -- un QToolTip nativo se cerraba solo con el primer micro-movimiento."""
 
-    def __init__(self):
-        super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(9, 7, 9, 7)
-        self._label = QLabel()
-        self._label.setTextFormat(Qt.TextFormat.RichText)
-        self._label.setStyleSheet("color: #F0F0F0; background: transparent;")
-        layout.addWidget(self._label)
-        self._btn_eliminar = QPushButton("Eliminar conexión")
+    def mostrar(self, texto, posicion_global):
+        self._label.setText(texto)
+        self._colocar(posicion_global)
+
+
+class _PopupConexion(_PopupFlotante):
+    """Mismo look, pero para el clic sobre una LÍNEA de conexión: muestra la
+    duración entre los dos puntos, y si la conexión es manual, un botón
+    para eliminarla (las automáticas no se eliminan una por una -- se
+    destildan desde 'Unir fechas')."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._btn_eliminar = QPushButton("Eliminar conexión  (Supr)")
         self._btn_eliminar.setStyleSheet(
             "background-color: #46465A; color: #F0F0F0; border: none; "
             "border-radius: 4px; padding: 4px 8px;"
         )
-        layout.addWidget(self._btn_eliminar)
-        self.setStyleSheet(
-            "background-color: #2B2B36; border: 1px solid #46465A; border-radius: 6px;"
-        )
+        self._layout.addWidget(self._btn_eliminar)
+        self._btn_eliminar.hide()
 
     def mostrar(self, texto, posicion_global, on_eliminar=None):
         self._label.setText(texto)
@@ -141,12 +176,7 @@ class _PopupConexion(QWidget):
             self._btn_eliminar.clicked.connect(on_eliminar)
         else:
             self._btn_eliminar.setVisible(False)
-        self.adjustSize()
-        self.move(posicion_global + QPoint(16, 16))
-        self.show()
-
-    def ocultar(self):
-        self.hide()
+        self._colocar(posicion_global)
 
 
 class _TarjetaAnomalia(QDialog):
@@ -261,12 +291,13 @@ class LineaTiempoPanel(QWidget):
         self.colors = host.colors
 
         self._columna_fecha = None
-        # Cómo leer una fecha ambigua tipo "03/04/2024": True = día/mes/año
-        # (Chile y la mayoría de países), False = mes/día/año (EE.UU.). Por
-        # defecto Chile, igual que el resto de Hadar (io_datos.py ya asume
-        # esto al escribir celdas a mano) -- el interruptor en la barra de
-        # herramientas deja cambiarlo para datasets que vengan de EE.UU.
-        self._dayfirst = True
+        # Cómo leer las fechas escritas como texto. "auto" (por defecto)
+        # mira los datos de CADA columna y decide entre AAAA/MM/DD,
+        # DD/MM/AAAA y MM/DD/AAAA (ver detectar_formato_fecha); "dmy",
+        # "mdy" o "ymd" fuerzan uno solo para todas las columnas, por si la
+        # detección se equivoca o el archivo es genuinamente ambiguo.
+        self._modo_formato = "auto"
+        self._formatos_detectados = {}   # {(tabla_o_None, columna): FormatoFecha}, cache por dataset
         self._columnas_mostrar = set()   # columnas de fecha tildadas en "Fechas a mostrar"
         self._color_por_columna = {}     # {columna: color}, estable mientras no cambien de dataset
         self._marcadores_anomalias = []  # [(scatter_item, anomalia_dict)]
@@ -280,7 +311,11 @@ class LineaTiempoPanel(QWidget):
         self._modo_conectar_manual = False
         self._primer_punto_manual = None
         self._posicion_punto = {}     # {(indice,columna): (x,y)} -- para ubicar los extremos de una línea
-        self._lineas_conexion = []    # [{"item":QGraphicsLineItem,"desde":...,"hasta":...,"duracion":...,"tipo":...,"etiqueta":...}]
+        self._lineas_conexion = []    # [{"item":QGraphicsLineItem,"desde":...,"hasta":...,"duracion":...,"tipo":...,"etiqueta":...,"p_ini":...,"p_fin":...,"color":...,"estilo":...}]
+        self._segmentos = None        # (x0, y0, x1, y1) en arrays numpy, paralelos a _lineas_conexion -- para acertar clics en líneas
+        self._conexion_seleccionada = None   # la línea resaltada (Supr la borra si es manual)
+        self._cruces_anomalias = []   # todas las anomalías calculadas con su fecha; se dibujan las que caen en el rango activo
+        self._total_fechas = 0        # fechas válidas de la columna de referencia SIN recortar por el slider (para el texto de estado)
 
         self._timer_debounce = QTimer(self)
         self._timer_debounce.setSingleShot(True)
@@ -314,13 +349,17 @@ class LineaTiempoPanel(QWidget):
 
         toolbar.addWidget(QLabel("Formato:"))
         self.combo_formato_fecha = QComboBox()
-        self.combo_formato_fecha.addItem("DD/MM/AAAA (Chile)", True)
-        self.combo_formato_fecha.addItem("MM/DD/AAAA (EE.UU.)", False)
+        self.combo_formato_fecha.addItem("Automático", "auto")
+        self.combo_formato_fecha.addItem("DD/MM/AAAA (Chile)", "dmy")
+        self.combo_formato_fecha.addItem("MM/DD/AAAA (EE.UU.)", "mdy")
+        self.combo_formato_fecha.addItem("AAAA/MM/DD (año primero)", "ymd")
+        self.combo_formato_fecha.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.combo_formato_fecha.setToolTip(
-            "Cómo leer una fecha ambigua como 03/04/2024. Chile: 3 de abril. "
-            "EE.UU.: 4 de marzo. Si tus fechas se ven todas amontonadas en "
-            "los primeros 12 días de cada mes, o los meses y días parecen "
-            "invertidos, prueba cambiar esto."
+            "Cómo leer las fechas escritas como texto. 'Automático' mira los "
+            "datos de cada columna y decide solo; entre paréntesis te dice "
+            "cuál eligió. Solo hace falta cambiarlo a mano si la detección "
+            "se equivoca o si todas las fechas caben en más de un orden "
+            "(ej. 03/04/2024 puede ser 3 de abril o 4 de marzo)."
         )
         self.combo_formato_fecha.currentIndexChanged.connect(self._on_formato_fecha_cambiado)
         toolbar.addWidget(self.combo_formato_fecha)
@@ -386,9 +425,10 @@ class LineaTiempoPanel(QWidget):
 
         self.aviso = QLabel(
             "Arrastra los bordes del área sombreada para recortar un período: "
-            "Métricas, Indicadores, Frecuencias y Alarmas se actualizan solas. "
-            "Un clic en un punto muestra la fila; un clic en una línea "
-            "muestra cuánto tiempo pasó entre sus dos puntos."
+            "el gráfico de abajo, Métricas, Indicadores, Frecuencias y Alarmas "
+            "se actualizan solos. Un clic en un punto muestra su fila; un clic "
+            "en una línea muestra cuánto tiempo pasó entre sus dos puntos (si "
+            "es manual, Supr la borra). Un clic en el vacío cierra el recuadro."
         )
         self.aviso.setObjectName("muted")
         self.aviso.setWordWrap(True)
@@ -446,9 +486,17 @@ class LineaTiempoPanel(QWidget):
         self._scatter_anomalias.sigClicked.connect(self._on_click_marcador_anomalia)
         self.plot_principal.addItem(self._scatter_anomalias)
 
-        self._popup_info_fila = _PopupInfoFila()
-        self._popup_conexion = _PopupConexion()
+        self._popup_info_fila = _PopupInfoFila(self)
+        self._popup_conexion = _PopupConexion(self)
         self.plot_principal.scene().sigMouseClicked.connect(self._on_click_principal)
+
+        # Supr / Retroceso borra la conexión manual seleccionada. El atajo
+        # solo vale mientras el foco esté en ESTA pestaña, para no pisar
+        # el Supr de la tabla de Datos.
+        for tecla in (QKeySequence(Qt.Key.Key_Delete), QKeySequence(Qt.Key.Key_Backspace)):
+            atajo = QShortcut(tecla, self)
+            atajo.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            atajo.activated.connect(self._borrar_conexion_seleccionada)
 
         pie = QHBoxLayout()
         self.btn_actualizar_anomalias = QPushButton("Actualizar anomalías en este rango")
@@ -472,6 +520,11 @@ class LineaTiempoPanel(QWidget):
             self.combo_fecha.blockSignals(False)
             self._limpiar_plots()
             return
+
+        # Dataset (o esquema) nuevo: hay que volver a mirar cómo vienen escritas
+        # las fechas, y lo que se calculó antes ya no corresponde.
+        self._formatos_detectados.clear()
+        self._cruces_anomalias = []
 
         columnas_fecha = detectar_columnas_fecha(df)
         self.combo_fecha.addItems(columnas_fecha)
@@ -602,8 +655,7 @@ class LineaTiempoPanel(QWidget):
     # Redibujo
     # ------------------------------------------------------------------
     def _limpiar_plots(self):
-        self._popup_info_fila.ocultar()
-        self._popup_conexion.ocultar()
+        self._ocultar_popups()
         for scatter in self._scatters_hitos.values():
             self.plot_principal.removeItem(scatter)
         self._scatters_hitos.clear()
@@ -616,29 +668,123 @@ class LineaTiempoPanel(QWidget):
         for conexion in self._lineas_conexion:
             self.plot_principal.removeItem(conexion["item"])
         self._lineas_conexion.clear()
+        self._segmentos = None
+        self._conexion_seleccionada = None
         self._scatter_anomalias.setData([])
         self._marcadores_anomalias.clear()
+        self._cruces_anomalias = []
         if self._barra_histograma is not None:
             self.plot_histograma.removeItem(self._barra_histograma)
             self._barra_histograma = None
 
-    def _redibujar_todo(self):
+    def _ocultar_popups(self):
         self._popup_info_fila.ocultar()
         self._popup_conexion.ocultar()
-        # Base filtrada por TODO lo de Datos (buscador de filas puntuales,
-        # filtro por columna, clic en un gráfico) menos el rango de este
-        # mismo slider -- así el buscador de filas SÍ se refleja acá.
+        self._deseleccionar_conexion()
+
+    def hideEvent(self, evento):
+        # Al cambiar de pestaña (o minimizar) el recuadro no debe quedar
+        # esperando a que vuelvas: se cierra, como si hubieras hecho clic en el vacío.
+        self._ocultar_popups()
+        super().hideEvent(evento)
+
+    # ------------------------------------------------------------------
+    # Formato de fecha (automático o forzado por el usuario)
+    # ------------------------------------------------------------------
+    def _formato_de(self, clave) -> FormatoFecha:
+        """Cómo leer la columna `clave` = (tabla_o_None, columna). En
+        automático se decide mirando la columna COMPLETA de su tabla de
+        origen (no el subconjunto filtrado), así el resultado no cambia
+        según qué filtros haya puestos en Datos, y se guarda en caché."""
+        if self._modo_formato != "auto":
+            return FormatoFecha(
+                orden=self._modo_formato, dayfirst=(self._modo_formato == "dmy"),
+                seguro=True, descripcion="",
+            )
+        formato = self._formatos_detectados.get(clave)
+        if formato is None:
+            tabla, columna = clave
+            df_fuente = self._df_de_tabla(tabla)
+            if df_fuente is None or columna not in df_fuente.columns:
+                formato = FormatoFecha(orden=None, dayfirst=True, seguro=False, descripcion="")
+            else:
+                formato = detectar_formato_fecha(df_fuente[columna])
+            self._formatos_detectados[clave] = formato
+        return formato
+
+    def _dayfirst_de(self, clave) -> bool:
+        return self._formato_de(clave).dayfirst
+
+    def _df_de_tabla(self, tabla):
+        """DataFrame completo (sin filtros de Datos) de la tabla activa
+        (tabla=None) o de otra tabla cargada."""
+        return self.host.df if tabla is None else self.host.tablas.get(tabla)
+
+    def _actualizar_texto_formato_auto(self):
+        """Deja escrito en el combo qué eligió el modo automático, para que
+        no sea una caja negra ("Automático: AAAA/MM/DD")."""
+        texto = "Automático"
+        if self._modo_formato == "auto" and self._columna_fecha:
+            descripcion = self._formato_de((None, self._columna_fecha)).descripcion
+            if descripcion:
+                texto = f"Automático: {descripcion}"
+        # Sin bloquear señales, cambiar el texto del ítem ACTUAL del combo dispara
+        # currentIndexChanged y se tomaría por un cambio de formato del usuario
+        # (que borra el rango del slider).
+        self.combo_formato_fecha.blockSignals(True)
+        self.combo_formato_fecha.setItemText(0, texto)
+        self.combo_formato_fecha.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Vista de abajo: qué se dibuja según el rango del slider
+    # ------------------------------------------------------------------
+    def _ventana_de_tiempo(self):
+        """(t0, t1) del rango activo del slider, o None si no hay recorte.
+        Mismas reglas que apply_table_filter(): el buscador de filas
+        puntuales de Datos ignora a propósito el rango."""
+        rango = self.host.rango_tiempo
+        if rango is None or self.host.filas_buscadas:
+            return None
+        return rango[0], rango[1]
+
+    def _df_en_rango(self):
+        """Lo que se dibuja abajo: la base filtrada por TODO lo de Datos
+        (buscador de filas, filtro por columna, clic en un gráfico) más el
+        recorte del slider. El histograma de arriba, en cambio, usa la base
+        SIN el recorte -- si no, se achicaría sobre sí mismo al arrastrar."""
         df = self.host._construir_df_filtrado_base()
-        if df is None or not self._columna_fecha or self._columna_fecha not in df.columns:
+        if df is None:
+            return None
+        return self.host._recortar_por_rango_tiempo(df)
+
+    def _redibujar_todo(self):
+        self._ocultar_popups()
+        df_base = self.host._construir_df_filtrado_base()
+        if df_base is None or not self._columna_fecha or self._columna_fecha not in df_base.columns:
             self._limpiar_plots()
             return
 
-        serie_hitos = construir_serie_hitos(df, self._columna_fecha, dayfirst=self._dayfirst)
+        clave_ref = (None, self._columna_fecha)
+        serie_hitos = construir_serie_hitos(df_base, self._columna_fecha, dayfirst=self._dayfirst_de(clave_ref))
+        self._total_fechas = len(serie_hitos)
         self._dibujar_histograma(serie_hitos)
+        self._actualizar_texto_formato_auto()
+        self._redibujar_principal()
+
+    def _redibujar_principal(self):
+        """Puntos + líneas de conexión + marcadores de anomalías de la vista
+        de abajo, para lo que cae dentro del rango del slider. NO toca el
+        histograma ni el propio slider: es lo único que hay que rehacer
+        cuando solo se movió el rango."""
+        self._ocultar_popups()
+        df = self._df_en_rango()
+        if df is None or not self._columna_fecha or self._columna_fecha not in df.columns:
+            return
 
         self.plot_principal.enableAutoRange(axis="xy")
         self._dibujar_hitos_multi(df)
         self._redibujar_conexiones(df)
+        self._pintar_marcadores_anomalias()
 
         # Bug real: self._columnas_mostrar guarda tuplas (tabla, columna)
         # desde que "Fechas a mostrar" se extendió a otras tablas -- un
@@ -648,10 +794,19 @@ class LineaTiempoPanel(QWidget):
         columnas_mostradas = ", ".join(
             self._etiqueta_clave(c) for c in sorted(self._columnas_mostrar, key=lambda c: (c[0] or "", c[1]))
         ) or self._columna_fecha
-        self.lbl_estado.setText(
-            f"{len(serie_hitos):,} fecha(s) válida(s) en '{self._columna_fecha}' "
-            f"(mostrando: {columnas_mostradas})."
-        )
+        if self._ventana_de_tiempo() is not None:
+            n_en_rango = len(construir_serie_hitos(
+                df, self._columna_fecha, dayfirst=self._dayfirst_de((None, self._columna_fecha)),
+            ))
+            self.lbl_estado.setText(
+                f"{n_en_rango:,} de {self._total_fechas:,} fecha(s) de '{self._columna_fecha}' "
+                f"dentro del período elegido (mostrando: {columnas_mostradas})."
+            )
+        else:
+            self.lbl_estado.setText(
+                f"{self._total_fechas:,} fecha(s) válida(s) en '{self._columna_fecha}' "
+                f"(mostrando: {columnas_mostradas})."
+            )
 
     def _dibujar_histograma(self, serie_hitos):
         if self._barra_histograma is not None:
@@ -711,7 +866,14 @@ class LineaTiempoPanel(QWidget):
             df_fuente = df if tabla is None else self.host.tablas.get(tabla)
             if df_fuente is None or columna not in df_fuente.columns:
                 continue
-            serie = construir_serie_hitos(df_fuente, columna, dayfirst=self._dayfirst)
+            serie = construir_serie_hitos(df_fuente, columna, dayfirst=self._dayfirst_de(clave))
+            if tabla is not None:
+                # Una tabla externa no tiene filas en común con la activa, así
+                # que el recorte del slider no la alcanza por fila: se aplica
+                # directamente sobre sus fechas (el tiempo sí es común).
+                ventana = self._ventana_de_tiempo()
+                if ventana is not None:
+                    serie = serie[(serie >= ventana[0]) & (serie <= ventana[1])]
             if not serie.empty:
                 series_por_clave[clave] = serie
 
@@ -850,6 +1012,7 @@ class LineaTiempoPanel(QWidget):
         for conexion in self._lineas_conexion:
             self.plot_principal.removeItem(conexion["item"])
         self._lineas_conexion.clear()
+        self._conexion_seleccionada = None  # sus líneas acaban de desaparecer
 
         # Automáticas: un par tildado en "Unir fechas" conecta ambas
         # columnas en cada fila donde las dos fechas son válidas. Se
@@ -859,7 +1022,11 @@ class LineaTiempoPanel(QWidget):
             par = self._pares_disponibles.get(clave)
             if par is None:
                 continue
-            intervalos = construir_intervalos(df, par, dayfirst=self._dayfirst)
+            intervalos = construir_intervalos(
+                df, par,
+                dayfirst=self._dayfirst_de((None, par.col_inicio)),
+                dayfirst_fin=self._dayfirst_de((None, par.col_fin)),
+            )
             color_normal = QColor(self._color_por_par.get(clave, COLOR_ACCENT))
             for indice, fila in intervalos.iterrows():
                 p_ini = self._posicion_punto.get((indice, (None, par.col_inicio)))
@@ -867,13 +1034,15 @@ class LineaTiempoPanel(QWidget):
                 if p_ini is None or p_fin is None:
                     continue
                 color = QColor(COLOR_DANGER) if fila["incoherente"] else color_normal
-                item = self._crear_linea(p_ini, p_fin, color, Qt.PenStyle.SolidLine)
-                self._lineas_conexion.append({
-                    "item": item, "desde": (indice, par.col_inicio), "hasta": (indice, par.col_fin),
-                    "duracion": fila["duracion"], "tipo": "auto", "etiqueta": par.etiqueta,
-                })
+                self._agregar_conexion(
+                    p_ini, p_fin, color, Qt.PenStyle.SolidLine,
+                    desde=(indice, par.col_inicio), hasta=(indice, par.col_fin),
+                    duracion=fila["duracion"], tipo="auto", etiqueta=par.etiqueta,
+                )
 
-        # Manuales: puntos elegidos a mano, de la misma fila o no.
+        # Manuales: puntos elegidos a mano, de la misma fila o no. Si algún
+        # extremo quedó fuera del rango del slider, la línea no se dibuja
+        # (sigue guardada: reaparece al ampliar el rango).
         for conexion in self._conexiones_manuales:
             p_ini = self._posicion_punto.get(conexion["desde"])
             p_fin = self._posicion_punto.get(conexion["hasta"])
@@ -887,26 +1056,63 @@ class LineaTiempoPanel(QWidget):
                 if (duracion is not None and duracion.total_seconds() < 0)
                 else QColor(_COLOR_CONEXION_MANUAL)
             )
-            item = self._crear_linea(p_ini, p_fin, color, Qt.PenStyle.DashLine)
-            self._lineas_conexion.append({
-                "item": item, "desde": conexion["desde"], "hasta": conexion["hasta"],
-                "duracion": duracion, "tipo": "manual", "etiqueta": "Conexión manual",
-            })
+            self._agregar_conexion(
+                p_ini, p_fin, color, Qt.PenStyle.DashLine,
+                desde=conexion["desde"], hasta=conexion["hasta"],
+                duracion=duracion, tipo="manual", etiqueta="Conexión manual",
+            )
 
-    def _crear_linea(self, p_ini, p_fin, color, estilo):
-        pluma = QPen(color, 2)
+        # Índice de segmentos en numpy para acertar clics sobre líneas (ver
+        # _conexion_bajo_cursor).
+        if self._lineas_conexion:
+            self._segmentos = (
+                np.array([c["p_ini"][0] for c in self._lineas_conexion], dtype=float),
+                np.array([c["p_ini"][1] for c in self._lineas_conexion], dtype=float),
+                np.array([c["p_fin"][0] for c in self._lineas_conexion], dtype=float),
+                np.array([c["p_fin"][1] for c in self._lineas_conexion], dtype=float),
+            )
+        else:
+            self._segmentos = None
+
+    def _agregar_conexion(self, p_ini, p_fin, color, estilo, **datos):
+        item = self._crear_linea(p_ini, p_fin, color, estilo)
+        self._lineas_conexion.append({
+            "item": item, "p_ini": p_ini, "p_fin": p_fin,
+            "color": color, "estilo": estilo, **datos,
+        })
+
+    @staticmethod
+    def _pintar_linea(item, color, estilo, grosor):
+        pluma = QPen(color, grosor)
         # Cosmetic=True fija el grosor en PÍXELES de pantalla, sin importar
-        # el zoom. Sin esto, un QGraphicsLineItem interpreta el "2" en
+        # el zoom. Sin esto, un QGraphicsLineItem interpreta el grosor en
         # unidades de dato -- al acercar el slider de rango, esas mismas 2
         # unidades pasan a cubrir muchos más píxeles, y la línea se ve cada
         # vez más ancha hasta tapar la pantalla (justo lo que se veía).
         pluma.setCosmetic(True)
         pluma.setStyle(estilo)
-        item = QGraphicsLineItem(p_ini[0], p_ini[1], p_fin[0], p_fin[1])
         item.setPen(pluma)
+
+    def _crear_linea(self, p_ini, p_fin, color, estilo):
+        item = QGraphicsLineItem(p_ini[0], p_ini[1], p_fin[0], p_fin[1])
+        self._pintar_linea(item, color, estilo, 2)
         item.setZValue(-1)  # detrás de los puntos, para no taparlos
         self.plot_principal.addItem(item)
         return item
+
+    def _seleccionar_conexion(self, conexion):
+        """Resalta la línea (más gruesa y del color del texto del tema) para
+        que se vea cuál es la que Supr va a borrar."""
+        self._deseleccionar_conexion()
+        self._conexion_seleccionada = conexion
+        self._pintar_linea(conexion["item"], QColor(self.colors["text"]), conexion["estilo"], 4)
+
+    def _deseleccionar_conexion(self):
+        conexion = self._conexion_seleccionada
+        self._conexion_seleccionada = None
+        # Si la vista se redibujó, esa línea ya no existe: no hay nada que restaurar.
+        if conexion is not None and any(conexion is c for c in self._lineas_conexion):
+            self._pintar_linea(conexion["item"], conexion["color"], conexion["estilo"], 2)
 
     def _fecha_de_punto(self, df, referencia):
         indice, clave = referencia
@@ -914,14 +1120,13 @@ class LineaTiempoPanel(QWidget):
         df_fuente = df if tabla is None else self.host.tablas.get(tabla)
         if df_fuente is None or columna not in df_fuente.columns or indice not in df_fuente.index:
             return None
-        valor = pd.to_datetime(df_fuente.loc[indice, columna], errors="coerce", dayfirst=self._dayfirst)
+        valor = parsear_fechas(pd.Series([df_fuente.loc[indice, columna]]), dayfirst=self._dayfirst_de(clave)).iloc[0]
         return valor if pd.notna(valor) else None
 
     def _on_toggle_conectar_manual(self, activo):
         self._modo_conectar_manual = activo
         self._primer_punto_manual = None
-        self._popup_info_fila.ocultar()
-        self._popup_conexion.ocultar()
+        self._ocultar_popups()
         if activo:
             self.lbl_estado.setText("Modo conectar activo: clic en el primer punto, luego en el segundo.")
         else:
@@ -935,17 +1140,23 @@ class LineaTiempoPanel(QWidget):
 
     def _aplicar_rango_activo(self):
         t0, t1 = self.region_rango.getRegion()
+        # El cuarto valor es el formato con que se leyó la columna: el filtro
+        # de main_window tiene que leer las fechas EXACTAMENTE igual que este
+        # panel, o el recorte y el gráfico hablarían de días distintos.
         self.host.rango_tiempo = (
             _epoch_a_timestamp(t0), _epoch_a_timestamp(t1), self._columna_fecha,
+            self._dayfirst_de((None, self._columna_fecha)),
         )
-        # apply_table_filter() no necesita redibujar ESTE panel por esto --
-        # la base que usamos para dibujar (_construir_df_filtrado_base) ya
-        # excluye el rango, así que nada de lo que se dibuja cambiaría.
+        # apply_table_filter() actualiza Datos/Métricas/Indicadores/etc. Su
+        # aviso de "redibuja la Línea de Tiempo" se salta a propósito cuando
+        # el cambio viene del slider (el histograma NO debe rehacerse en cada
+        # arrastre); la vista de abajo sí se rehace a mano justo después.
         self._actualizando_desde_slider = True
         try:
             self.host.apply_table_filter()
         finally:
             self._actualizando_desde_slider = False
+        self._redibujar_principal()
 
     def refrescar_vista(self):
         """Redibuja con los filtros de Datos actuales (buscador de filas,
@@ -953,7 +1164,9 @@ class LineaTiempoPanel(QWidget):
         menú de columnas -- eso es cosa de refrescar_datos(), pensado para
         cuando cambia el ESQUEMA, no los filtros. Se llama sola cada vez que
         cambia cualquier filtro de Datos (ver el hook en apply_table_filter),
-        y también con el botón "Actualizar", por si acaso."""
+        y también con el botón "Actualizar", por si acaso (ahí además se
+        vuelve a detectar el formato de las fechas)."""
+        self._formatos_detectados.clear()
         self._redibujar_todo()
 
     def limpiar_rango(self):
@@ -961,21 +1174,33 @@ class LineaTiempoPanel(QWidget):
         self.host.apply_table_filter()
         self._redibujar_todo()
 
+    def _reiniciar_rango_y_redibujar(self):
+        """Quita el recorte del slider y rehace todo. Si había un recorte,
+        pasa por apply_table_filter() para que Datos/Métricas/etc. también
+        lo pierdan (antes solo se olvidaba el rango y esas pestañas
+        quedaban recortadas con un rango que ya no existía); ese mismo
+        llamado redibuja este panel por el hook de main_window."""
+        habia_rango = self.host.rango_tiempo is not None
+        self.host.rango_tiempo = None
+        if habia_rango:
+            self.host.apply_table_filter()
+        else:
+            self._redibujar_todo()
+
     def _on_columna_fecha_cambiada(self, texto):
         if not texto:
             return
         self._columna_fecha = texto
-        self.host.rango_tiempo = None
-        self._redibujar_todo()
+        self._reiniciar_rango_y_redibujar()
 
     def _on_formato_fecha_cambiado(self, _indice):
-        self._dayfirst = self.combo_formato_fecha.currentData()
+        self._modo_formato = self.combo_formato_fecha.currentData()
+        self._formatos_detectados.clear()
         # Todas las fechas ya dibujadas se leyeron con el formato viejo --
         # hay que rehacer el rango (los bordes cambian si, por ejemplo, lo
         # que se leía como "3 de abril" pasa a ser "4 de marzo") y todo el
         # dibujo, no solo refrescar_vista().
-        self.host.rango_tiempo = None
-        self._redibujar_todo()
+        self._reiniciar_rango_y_redibujar()
 
     # ------------------------------------------------------------------
     # Anomalías: bajo demanda, nunca en cada arrastre del slider
@@ -995,112 +1220,188 @@ class LineaTiempoPanel(QWidget):
         if self.host.fingerprint_actual:
             anomalias = self.host.memoria.enriquecer_con_memoria(self.host.fingerprint_actual, anomalias)
 
-        cruces = anomalias_con_fecha(anomalias, df, self._columna_fecha, dayfirst=self._dayfirst)
-        self._marcadores_anomalias = cruces
+        cruces = anomalias_con_fecha(
+            anomalias, df, self._columna_fecha, dayfirst=self._dayfirst_de((None, self._columna_fecha)),
+        )
+        self._cruces_anomalias = cruces
+        self._pintar_marcadores_anomalias()
         if not cruces:
-            self._scatter_anomalias.setData([])
             self.lbl_estado.setText("Sin anomalías detectadas en este rango.")
             return
-
-        xs = [_timestamp_a_epoch(c["fecha"]) for c in cruces]
-        y_base = float(self._hitos_ys_ordenados.max()) + 2 if len(self._hitos_ys_ordenados) else 1
-        ys = [y_base] * len(xs)
-        self._scatter_anomalias.setData(x=xs, y=ys)
         self.lbl_estado.setText(f"{len(cruces)} anomalía(s) marcada(s) en este rango.")
+
+    def _pintar_marcadores_anomalias(self):
+        """Dibuja solo las anomalías (ya calculadas) que caen dentro del rango
+        activo del slider. Así, al recortar el período, no quedan marcadores
+        flotando fuera de la vista ni estirando el gráfico hacia fechas que
+        ya no se están mirando."""
+        visibles = self._cruces_anomalias
+        ventana = self._ventana_de_tiempo()
+        if ventana is not None:
+            visibles = [c for c in visibles if ventana[0] <= c["fecha"] <= ventana[1]]
+        self._marcadores_anomalias = visibles
+        if not visibles:
+            self._scatter_anomalias.setData([])
+            return
+        xs = [_timestamp_a_epoch(c["fecha"]) for c in visibles]
+        y_base = float(self._hitos_ys_ordenados.max()) + 2 if len(self._hitos_ys_ordenados) else 1
+        self._scatter_anomalias.setData(x=xs, y=[y_base] * len(xs))
 
     # ------------------------------------------------------------------
     # Clics sobre la vista principal: punto (info de fila / conectar
     # manualmente) o línea (duración). Búsqueda de puntos siempre binaria
     # (np.searchsorted, O(log n)) -- segura con 100 mil filas.
     # ------------------------------------------------------------------
-    def _punto_bajo_cursor(self, pos):
-        if len(self._hitos_xs_ordenados) == 0:
-            return None
+    def _escala_pixeles(self):
+        """(vista, píxeles por unidad de dato en X, ídem en Y) de la vista
+        principal ahora mismo -- para medir distancias en píxeles de
+        pantalla, que es lo que el usuario percibe al apuntar."""
         vb = self.plot_principal.getPlotItem().vb
-        punto = vb.mapSceneToView(pos)
         (x0, x1), (y0, y1) = vb.viewRange()
         rect_vista = vb.boundingRect()
-        datos_por_px_x = (x1 - x0) / max(rect_vista.width(), 1)
-        datos_por_px_y = (y1 - y0) / max(rect_vista.height(), 1)
-        tolerancia_x = datos_por_px_x * 14
-        tolerancia_y = datos_por_px_y * 14
+        px_por_x = max(rect_vista.width(), 1) / max(x1 - x0, 1e-12)
+        px_por_y = max(rect_vista.height(), 1) / max(y1 - y0, 1e-12)
+        return vb, px_por_x, px_por_y
 
-        idx = int(np.searchsorted(self._hitos_xs_ordenados, punto.x()))
-        ventana = range(max(0, idx - 5), min(len(self._hitos_xs_ordenados), idx + 5))
-        candidatos = [
-            i for i in ventana
-            if abs(self._hitos_xs_ordenados[i] - punto.x()) <= tolerancia_x
-        ]
-        if not candidatos:
+    def _punto_bajo_cursor(self, pos):
+        """El punto más cercano al clic (a menos de _TOLERANCIA_PUNTO_PX
+        píxeles), o None. Los puntos están ordenados por X, así que se
+        acota con búsqueda binaria (O(log n)) la franja de X que cae dentro
+        de la tolerancia y solo ahí se mide la distancia real -- segura con
+        100 mil filas. (Antes se miraban solo los 10 vecinos por X, y en
+        zonas densas el punto apuntado podía quedar fuera de esos 10.)"""
+        if len(self._hitos_xs_ordenados) == 0:
             return None
-        mejor = min(candidatos, key=lambda i: abs(self._hitos_ys_ordenados[i] - punto.y()))
-        if abs(self._hitos_ys_ordenados[mejor] - punto.y()) > tolerancia_y:
+        vb, px_por_x, px_por_y = self._escala_pixeles()
+        punto = vb.mapSceneToView(pos)
+        tolerancia_x = _TOLERANCIA_PUNTO_PX / px_por_x
+        lo = int(np.searchsorted(self._hitos_xs_ordenados, punto.x() - tolerancia_x, side="left"))
+        hi = int(np.searchsorted(self._hitos_xs_ordenados, punto.x() + tolerancia_x, side="right"))
+        if lo >= hi:
             return None
-        return self._hitos_indices_ordenados[mejor], self._hitos_columna_ordenada[mejor]
+        dx = (self._hitos_xs_ordenados[lo:hi] - punto.x()) * px_por_x
+        dy = (self._hitos_ys_ordenados[lo:hi] - punto.y()) * px_por_y
+        distancia2 = dx * dx + dy * dy
+        mejor = int(np.argmin(distancia2))
+        if distancia2[mejor] > _TOLERANCIA_PUNTO_PX ** 2:
+            return None
+        i = lo + mejor
+        return self._hitos_indices_ordenados[i], self._hitos_columna_ordenada[i]
 
     def _conexion_bajo_cursor(self, pos):
-        # QGraphicsLineItem con un pen de 2px ya tiene una zona de clic
-        # razonable vía su shape() nativo -- se usa el picking normal de
-        # Qt en vez de reinventar geometría de distancia punto-segmento.
-        items_bajo_cursor = self.plot_principal.scene().items(pos)
-        for conexion in self._lineas_conexion:
-            if conexion["item"] in items_bajo_cursor:
-                return conexion
-        return None
+        """La línea más cercana al clic (a menos de _TOLERANCIA_LINEA_PX
+        píxeles), o None. Se mide la distancia punto-segmento en píxeles con
+        numpy. Antes se usaba el picking de Qt (scene().items(pos)), que casi
+        nunca acertaba: el 'grosor' de la línea para Qt está en unidades de
+        DATO (segundos de fecha en X, minutos en Y), y en pantalla eso es
+        una franja de una fracción de píxel -- imposible de clicar."""
+        if self._segmentos is None:
+            return None
+        vb, px_por_x, px_por_y = self._escala_pixeles()
+        punto = vb.mapSceneToView(pos)
+        x0, y0, x1, y1 = self._segmentos
+        # Todo relativo al cursor y en píxeles: el cursor queda en (0, 0).
+        ax = (x0 - punto.x()) * px_por_x
+        ay = (y0 - punto.y()) * px_por_y
+        bx = (x1 - punto.x()) * px_por_x
+        by = (y1 - punto.y()) * px_por_y
+        dx, dy = bx - ax, by - ay
+        largo2 = dx * dx + dy * dy
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = np.where(largo2 > 0, -(ax * dx + ay * dy) / largo2, 0.0)
+        t = np.clip(t, 0.0, 1.0)
+        cx, cy = ax + t * dx, ay + t * dy
+        distancia2 = cx * cx + cy * cy
+        mejor = int(np.argmin(distancia2))
+        if distancia2[mejor] > _TOLERANCIA_LINEA_PX ** 2:
+            return None
+        return self._lineas_conexion[mejor]
+
+    @staticmethod
+    def _numero_fila(df, indice):
+        """Número de fila tal como lo cuenta el buscador de filas de Datos:
+        la posición dentro de la tabla completa, empezando en 1. Si el
+        índice tiene etiquetas repetidas no hay una sola posición, y se
+        muestra la etiqueta tal cual."""
+        try:
+            posicion = df.index.get_loc(indice)
+        except KeyError:
+            return indice
+        if isinstance(posicion, (int, np.integer)):
+            return int(posicion) + 1
+        return indice
 
     def _on_click_principal(self, evento):
+        # Solo clic izquierdo: el derecho abre el menú propio de PyQtGraph.
+        if evento.button() != Qt.MouseButton.LeftButton:
+            return
+        # Foco en el gráfico: sin esto, Supr no llega al atajo de esta pestaña.
+        self.plot_principal.setFocus()
         pos = evento.scenePos()
         if not self.plot_principal.sceneBoundingRect().contains(pos):
-            self._popup_info_fila.ocultar()
-            self._popup_conexion.ocultar()
+            self._ocultar_popups()
             return
 
-        if not self._modo_conectar_manual:
-            conexion = self._conexion_bajo_cursor(pos)
-            if conexion is not None:
-                self._popup_info_fila.ocultar()
-                self._mostrar_info_conexion(conexion)
-                return
-
+        # Un punto siempre tiene su línea tocándolo justo en el extremo: si
+        # las líneas se probaran primero, hacer clic en un punto conectado
+        # mostraría la duración en vez de su fila, y esa fila sería inalcanzable.
         resultado_punto = self._punto_bajo_cursor(pos)
-        if resultado_punto is None:
-            self._popup_info_fila.ocultar()
-            self._popup_conexion.ocultar()
+
+        if resultado_punto is not None and self._modo_conectar_manual:
+            self._on_click_punto_conectando(resultado_punto)
             return
+
+        if resultado_punto is not None:
+            self._deseleccionar_conexion()
+            self._popup_conexion.ocultar()
+            self._mostrar_info_fila(resultado_punto)
+            return
+
+        conexion = self._conexion_bajo_cursor(pos)
+        if conexion is not None:
+            self._popup_info_fila.ocultar()
+            self._seleccionar_conexion(conexion)
+            self._mostrar_info_conexion(conexion)
+            return
+
+        # Clic en el vacío del gráfico: se cierra todo.
+        self._ocultar_popups()
+
+    def _on_click_punto_conectando(self, resultado_punto):
         indice_real, columna_origen = resultado_punto
+        self._ocultar_popups()
+        if self._primer_punto_manual is None:
+            self._primer_punto_manual = (indice_real, columna_origen)
+            numero = self._numero_fila(self._df_de_tabla(columna_origen[0]), indice_real)
+            self.lbl_estado.setText(
+                f"Primer punto: fila {numero}, '{self._etiqueta_clave(columna_origen)}'. Clic en el segundo punto."
+            )
+        elif self._primer_punto_manual == (indice_real, columna_origen):
+            self.lbl_estado.setText("Elige un segundo punto distinto del primero.")
+        else:
+            self._conexiones_manuales.append({
+                "desde": self._primer_punto_manual, "hasta": (indice_real, columna_origen),
+            })
+            self._primer_punto_manual = None
+            self.lbl_estado.setText("Conexión creada. Puedes seguir conectando, o apagar el modo.")
+            df = self._df_en_rango()
+            self._dibujar_hitos_multi(df)  # por si el 2do punto no estaba visible aún
+            self._redibujar_conexiones(df)
 
-        if self._modo_conectar_manual:
-            self._popup_conexion.ocultar()
-            self._popup_info_fila.ocultar()
-            if self._primer_punto_manual is None:
-                self._primer_punto_manual = (indice_real, columna_origen)
-                self.lbl_estado.setText(
-                    f"Primer punto: fila {indice_real}, '{columna_origen}'. Clic en el segundo punto."
-                )
-            elif self._primer_punto_manual == (indice_real, columna_origen):
-                self.lbl_estado.setText("Elige un segundo punto distinto del primero.")
-            else:
-                self._conexiones_manuales.append({
-                    "desde": self._primer_punto_manual, "hasta": (indice_real, columna_origen),
-                })
-                self._primer_punto_manual = None
-                self.lbl_estado.setText("Conexión creada. Puedes seguir conectando, o apagar el modo.")
-                df = self.host._construir_df_filtrado_base()
-                self._dibujar_hitos_multi(df)  # por si el 2do punto no estaba visible aún
-                self._redibujar_conexiones(df)
-            return
-
-        self._popup_conexion.ocultar()
-        tabla_origen, nombre_columna_origen = columna_origen
-        df_para_fila = self.host.df if tabla_origen is None else self.host.tablas.get(tabla_origen)
+    def _mostrar_info_fila(self, resultado_punto):
+        indice_real, columna_origen = resultado_punto
+        tabla_origen, _ = columna_origen
+        df_para_fila = self._df_de_tabla(tabla_origen)
         if df_para_fila is None or indice_real not in df_para_fila.index:
             self._popup_info_fila.ocultar()
             return
         fila = df_para_fila.loc[indice_real]
-        texto = "<br>".join(f"<b>{col}:</b> {valor}" for col, valor in fila.items())
+        numero = self._numero_fila(df_para_fila, indice_real)
+        cabecera = f"<b>Fila {numero}</b>" + ("" if tabla_origen is None else f" · tabla {tabla_origen}")
+        cuerpo = "<br>".join(f"<b>{col}:</b> {valor}" for col, valor in fila.items())
+        texto = f"{cabecera}<br>{cuerpo}"
         if len(self._columnas_mostrar) > 1 or self._pares_conectar or self._conexiones_manuales:
-            etiqueta_origen = self._etiqueta_clave(columna_origen)
-            texto = f"<i>Fecha desde: {etiqueta_origen}</i><br>{texto}"
+            texto = f"{cabecera}<br><i>Fecha desde: {self._etiqueta_clave(columna_origen)}</i><br>{cuerpo}"
         self._popup_info_fila.mostrar(texto, QCursor.pos())
 
     def _mostrar_info_conexion(self, conexion):
@@ -1114,13 +1415,22 @@ class LineaTiempoPanel(QWidget):
             on_eliminar = lambda: self._eliminar_conexion_manual(conexion)
         self._popup_conexion.mostrar(texto, QCursor.pos(), on_eliminar=on_eliminar)
 
+    def _borrar_conexion_seleccionada(self):
+        """Supr / Retroceso: borra la conexión manual que está resaltada.
+        Las automáticas no se borran una por una (vienen de un par tildado
+        en 'Unir fechas'), así que ahí no hace nada."""
+        conexion = self._conexion_seleccionada
+        if conexion is None or conexion["tipo"] != "manual":
+            return
+        self._eliminar_conexion_manual(conexion)
+
     def _eliminar_conexion_manual(self, conexion):
         self._conexiones_manuales = [
             c for c in self._conexiones_manuales
             if not (c["desde"] == conexion["desde"] and c["hasta"] == conexion["hasta"])
         ]
-        self._popup_conexion.ocultar()
-        self._redibujar_conexiones(self.host._construir_df_filtrado_base())
+        self._ocultar_popups()
+        self._redibujar_conexiones(self._df_en_rango())
 
     def _on_click_marcador_anomalia(self, _scatter, puntos):
         if not puntos:
@@ -1151,7 +1461,11 @@ class LineaTiempoPanel(QWidget):
             par = self._pares_disponibles.get(clave)
             if par is None:
                 continue
-            intervalos = construir_intervalos(df, par, dayfirst=self._dayfirst)
+            intervalos = construir_intervalos(
+                df, par,
+                dayfirst=self._dayfirst_de((None, par.col_inicio)),
+                dayfirst_fin=self._dayfirst_de((None, par.col_fin)),
+            )
             if intervalos.empty:
                 continue
             resumen = resumen_duraciones(intervalos["duracion"])

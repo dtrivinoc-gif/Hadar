@@ -66,6 +66,7 @@ from .contagio import explorar_linaje, columna_clave_de_tabla
 from .alarmas import AlarmaHadar, AlarmaCard, DialogoAlarma, calcular_valor_actual, evaluar_regla
 from .notificaciones import DialogoConfiguracionCorreo, disparar_envio_correo, cargar_configuracion
 from .linea_tiempo_ui import LineaTiempoPanel
+from .linea_tiempo import parsear_fechas
 from .limpieza import (
     detectar_limpieza_sugerida, agrupar_por_tipo,
     aplicar_eliminar_duplicados, aplicar_espacios_en_blanco,
@@ -435,8 +436,11 @@ class HadarApp(QMainWindow):
         self.fingerprint_actual = None
 
         # Rango activo de la Línea de Tiempo: None = sin recortar, o
-        # (t0: Timestamp, t1: Timestamp, columna: str). Lo consume
-        # apply_table_filter() igual que ya hace con self.filtro_grafico.
+        # (t0: Timestamp, t1: Timestamp, columna: str, dayfirst: bool). Lo
+        # consume _recortar_por_rango_tiempo() (Datos, Métricas, etc. vía
+        # apply_table_filter) y la vista de puntos de la propia Línea de
+        # Tiempo. dayfirst es el formato con que la Línea de Tiempo leyó esa
+        # columna: se guarda acá para que el filtro lea las fechas IGUAL.
         self.rango_tiempo = None
 
         # Filas específicas buscadas a mano en Datos (ej. "2000, 3000, 27, 8")
@@ -2667,16 +2671,25 @@ class HadarApp(QMainWindow):
 
         return df
 
+    def _recortar_por_rango_tiempo(self, df):
+        """Aplica a `df` el rango del slider de la Línea de Tiempo (si hay
+        uno). Lo usan apply_table_filter() y LineaTiempoPanel para dibujar
+        su vista de puntos, así los dos recortan exactamente las mismas
+        filas. Con el buscador de filas puntuales activo el rango se ignora
+        (ver el comentario de self.filas_buscadas)."""
+        if self.filas_buscadas or not self.rango_tiempo:
+            return df
+        t0, t1, col_t, *resto = self.rango_tiempo
+        if col_t not in df.columns:
+            return df
+        dayfirst = resto[0] if resto else True
+        fechas = parsear_fechas(df[col_t], dayfirst=dayfirst)
+        return df[(fechas >= t0) & (fechas <= t1)]
+
     def apply_table_filter(self):
         if self.df is None:
             return
-        df = self._construir_df_filtrado_base()
-
-        if not self.filas_buscadas and self.rango_tiempo:
-            t0, t1, col_t = self.rango_tiempo
-            if col_t in df.columns:
-                fechas = pd.to_datetime(df[col_t], errors="coerce", format="mixed")
-                df = df[(fechas >= t0) & (fechas <= t1)]
+        df = self._recortar_por_rango_tiempo(self._construir_df_filtrado_base())
 
         self.filtered_df = df
         self._refrescar_barra_filtro()

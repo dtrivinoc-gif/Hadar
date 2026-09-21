@@ -19,6 +19,7 @@ Nunca se asume que existe una columna con un nombre en particular.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
 
@@ -80,6 +81,88 @@ def sugerir_pares_temporales(columnas_fecha, pares_personalizados=None):
 
 
 # ----------------------------------------------------------------------
+# Formato de fecha (orden día/mes/año) -- detección automática
+# ----------------------------------------------------------------------
+
+# Año primero: 2026-04-27, 2026/04/27, 2026.04.27 (con o sin hora después).
+_RE_ANIO_PRIMERO = re.compile(r"^\s*(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)")
+# Año al final: 27/04/2026, 4-27-26, 27.04.2026 (con o sin hora después).
+_RE_ANIO_AL_FINAL = re.compile(r"^\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{4}|\d{2})(?!\d)")
+
+
+@dataclass
+class FormatoFecha:
+    orden: str | None   # "ymd" | "dmy" | "mdy" | None (no se pudo decidir)
+    dayfirst: bool      # lo que hay que pasarle a pandas.to_datetime
+    seguro: bool        # False = se asumió DD/MM por defecto, sin evidencia
+    descripcion: str    # texto corto para mostrar en pantalla ("" = no aplica)
+
+
+def detectar_formato_fecha(serie: pd.Series, max_muestras: int = 2000) -> FormatoFecha:
+    """Decide cómo leer una columna de fechas escritas como texto, mirando
+    los datos en vez de preguntarle al usuario.
+
+    Reglas (todas verificables a ojo, nada de heurística opaca):
+      - Si empieza con 4 dígitos (2026-04-27) es AAAA/MM/DD: en ese orden
+        el mes siempre va antes que el día, así que se lee con
+        dayfirst=False. IMPORTANTE: con dayfirst=True pandas leería
+        2026-04-05 como el 4 de mayo, no el 5 de abril.
+      - Si termina en año (27/04/2026): un primer número mayor a 12 solo
+        puede ser un día (=> DD/MM); un segundo número mayor a 12 solo
+        puede ser un día (=> MM/DD).
+      - Si todos los valores caben en ambos órdenes (nada mayor a 12) es
+        genuinamente ambiguo: se deja el DD/MM de siempre y se marca
+        seguro=False para que la pantalla lo diga en vez de fingir certeza.
+
+    Determinista: la muestra usa random_state fijo, así que el mismo
+    archivo siempre da el mismo resultado."""
+    if pd.api.types.is_datetime64_any_dtype(serie):
+        return FormatoFecha(orden=None, dayfirst=True, seguro=True, descripcion="")
+
+    textos = serie.dropna().astype(str)
+    if textos.empty:
+        return FormatoFecha(orden=None, dayfirst=True, seguro=False, descripcion="")
+    if len(textos) > max_muestras:
+        textos = textos.sample(max_muestras, random_state=0)
+
+    anio_primero = textos.str.extract(_RE_ANIO_PRIMERO).dropna()
+    anio_final = textos.str.extract(_RE_ANIO_AL_FINAL).dropna()
+    n_ymd, n_dm = len(anio_primero), len(anio_final)
+
+    if n_ymd == 0 and n_dm == 0:
+        return FormatoFecha(orden=None, dayfirst=True, seguro=False, descripcion="")
+
+    if n_ymd >= n_dm:
+        mezcla = n_dm > 0
+        return FormatoFecha(
+            orden="ymd", dayfirst=False, seguro=not mezcla,
+            descripcion="AAAA/MM/DD, con algunas filas en otro orden" if mezcla else "AAAA/MM/DD",
+        )
+
+    primero = anio_final[0].astype(int)
+    segundo = anio_final[1].astype(int)
+    primero_es_dia = bool((primero > 12).any())
+    segundo_es_dia = bool((segundo > 12).any())
+
+    if primero_es_dia and segundo_es_dia:
+        return FormatoFecha(orden=None, dayfirst=True, seguro=False,
+                            descripcion="formatos mezclados, se asumió DD/MM/AAAA")
+    if primero_es_dia:
+        return FormatoFecha(orden="dmy", dayfirst=True, seguro=True, descripcion="DD/MM/AAAA")
+    if segundo_es_dia:
+        return FormatoFecha(orden="mdy", dayfirst=False, seguro=True, descripcion="MM/DD/AAAA")
+    return FormatoFecha(orden=None, dayfirst=True, seguro=False,
+                        descripcion="DD/MM/AAAA asumido (ninguna fecha lo confirma)")
+
+
+def parsear_fechas(serie: pd.Series, dayfirst: bool = True) -> pd.Series:
+    """ÚNICO punto donde Hadar convierte texto a fecha en la Línea de
+    Tiempo y en el filtro por rango de main_window -- así el gráfico y los
+    filtros nunca leen la misma columna de dos formas distintas."""
+    return pd.to_datetime(serie, errors="coerce", format="mixed", dayfirst=dayfirst)
+
+
+# ----------------------------------------------------------------------
 # Modo Hito
 # ----------------------------------------------------------------------
 
@@ -90,12 +173,11 @@ def construir_serie_hitos(df: pd.DataFrame, columna_fecha: str, dayfirst: bool =
 
     dayfirst decide cómo se lee una fecha ambigua tipo "03/04/2024":
     True = 3 de abril (Chile y la mayoría de países), False = 4 de marzo
-    (Estados Unidos). Nunca se asume un país por defecto en el resto de
-    este archivo -- pero acá SÍ hace falta un default explícito porque
-    pandas, sin instrucciones, interpreta como EE.UU. Se deja en True
-    porque el resto de Hadar (io_datos.cast_valor_a_dtype) ya asume lo
-    mismo; quien cargue datos de EE.UU. cambia el interruptor en la UI."""
-    fechas = pd.to_datetime(df[columna_fecha], errors="coerce", format="mixed", dayfirst=dayfirst)
+    (Estados Unidos) y también AAAA/MM/DD. Quien llama normalmente no lo
+    elige a mano: la UI lo saca de detectar_formato_fecha(). El default
+    True se mantiene solo porque io_datos.cast_valor_a_dtype ya asume lo
+    mismo al escribir celdas a mano."""
+    fechas = parsear_fechas(df[columna_fecha], dayfirst=dayfirst)
     return fechas.dropna()
 
 
@@ -142,13 +224,15 @@ def construir_series_hitos_multiples(df: pd.DataFrame, columnas, dayfirst: bool 
 # Pares inicio/fin por fila + incoherencias cronológicas
 # ----------------------------------------------------------------------
 
-def construir_intervalos(df: pd.DataFrame, par: ParTemporal, dayfirst: bool = True) -> pd.DataFrame:
+def construir_intervalos(df: pd.DataFrame, par: ParTemporal, dayfirst: bool = True,
+                         dayfirst_fin: bool | None = None) -> pd.DataFrame:
     """DataFrame con inicio, fin, duración y marca de incoherencia (fin
     anterior a inicio) para conectar cada fila con una línea. El índice se conserva
     para poder ubicar la fila real de cada barra. Ver construir_serie_hitos
-    para qué decide dayfirst."""
-    inicio = pd.to_datetime(df[par.col_inicio], errors="coerce", format="mixed", dayfirst=dayfirst)
-    fin = pd.to_datetime(df[par.col_fin], errors="coerce", format="mixed", dayfirst=dayfirst)
+    para qué decide dayfirst. dayfirst_fin permite que la columna de fin
+    tenga otro formato que la de inicio (None = el mismo)."""
+    inicio = parsear_fechas(df[par.col_inicio], dayfirst=dayfirst)
+    fin = parsear_fechas(df[par.col_fin], dayfirst=dayfirst if dayfirst_fin is None else dayfirst_fin)
     validas = inicio.notna() & fin.notna()
     resultado = pd.DataFrame({
         "inicio": inicio[validas],
@@ -223,7 +307,7 @@ def anomalias_con_fecha(anomalias: list[dict], df: pd.DataFrame, columna_fecha_r
     construir_serie_hitos para qué decide dayfirst."""
     if columna_fecha_referencia not in df.columns:
         return []
-    fechas_df = pd.to_datetime(df[columna_fecha_referencia], errors="coerce", format="mixed", dayfirst=dayfirst)
+    fechas_df = parsear_fechas(df[columna_fecha_referencia], dayfirst=dayfirst)
 
     resultado = []
     for a in anomalias:
