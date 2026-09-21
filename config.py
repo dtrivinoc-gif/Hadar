@@ -7,50 +7,6 @@ importación circular.
 import os
 import sys
 
-import os
-import re
-import sys
-import ast
-import math
-import json
-import base64
-import hashlib
-import sqlite3
-import operator
-import unicodedata
-from contextlib import contextmanager
-from datetime import datetime, timezone
-
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-
-try:
-    import polars as pl
-except ImportError:
-    pl = None
-
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, Signal, QObject, QPointF, QRectF, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QIcon, QPixmap, QPageSize, QTextCharFormat
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QComboBox, QListWidget, QListWidgetItem, QAbstractItemView,
-    QTableView, QTabWidget, QScrollArea, QFrame, QLineEdit, QMessageBox,
-    QFileDialog, QSizePolicy, QRadioButton, QButtonGroup, QHeaderView, QInputDialog,
-    QCheckBox, QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsEllipseItem,
-    QGraphicsTextItem, QGraphicsPixmapItem, QGraphicsItem, QMenu, QTabBar,
-    QDialog, QDialogButtonBox, QTextEdit, QTextBrowser
-)
-from PySide6.QtPrintSupport import QPrinter
-
-import pyqtgraph as pg
-
-try:
-    import requests
-except ImportError:
-    requests = None
-
 
 # ----------------------------------------------------------------------------
 # Paletas de colores

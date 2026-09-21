@@ -442,6 +442,8 @@ class HadarApp(QMainWindow):
         # Tiempo. dayfirst es el formato con que la Línea de Tiempo leyó esa
         # columna: se guarda acá para que el filtro lea las fechas IGUAL.
         self.rango_tiempo = None
+        # Fechas ya interpretadas de la columna del rango (ver _fechas_de_columna).
+        self._cache_fechas = None
 
         # Filas específicas buscadas a mano en Datos (ej. "2000, 3000, 27, 8")
         # para comparar registros puntuales. None = sin buscador activo.
@@ -2438,6 +2440,7 @@ class HadarApp(QMainWindow):
         if self.df is None or row_label not in self.df.index:
             return
         self.df.at[row_label, col_name] = nuevo_valor
+        self._cache_fechas = None   # por si la celda editada era una fecha
         self.apply_table_filter()
 
     def _abrir_dialogo_nota(self):
@@ -2508,6 +2511,7 @@ class HadarApp(QMainWindow):
         seleccion_frecuencias = [item.text() for item in self.freq_col_list.selectedItems()]
 
         self.df.rename(columns={nombre_actual: nuevo_nombre}, inplace=True)
+        self._cache_fechas = None
         self.procedencia.renombrar_columna(self.nombre_tabla_activa, nombre_actual, nuevo_nombre)
 
         if self.filtro_grafico and self.filtro_grafico.get("columna") == nombre_actual:
@@ -2638,7 +2642,11 @@ class HadarApp(QMainWindow):
         disponible para recortar."""
         if self.df is None:
             return None
-        df = self.df.copy()
+        # Sin .copy(): los filtros de abajo nunca modifican `df`, solo arman
+        # máscaras y al final se recorta UNA vez (df[mascara] ya devuelve una
+        # tabla nueva). Antes se copiaba la tabla entera en cada cambio de
+        # filtro, incluso sin ningún filtro activo.
+        df = self.df
 
         if self.filas_buscadas:
             # Modo "comparar filas puntuales": a propósito se ignoran los
@@ -2648,28 +2656,37 @@ class HadarApp(QMainWindow):
             posiciones_validas = [p for p in self.filas_buscadas if p < len(df)]
             return df.iloc[posiciones_validas]
 
+        mascara = None   # np.ndarray de bool alineado con las filas de `df`
+
         col = self.datos_filter_col.currentText()
         if col and col != "Sin filtro":
             selected_vals = [item.text() for item in self.datos_values_list.selectedItems()]
             if selected_vals:
                 incluir_vacios = VALOR_VACIO_FILTRO in selected_vals
                 valores_normales = [v for v in selected_vals if v != VALOR_VACIO_FILTRO]
-                mascara = df[col].astype(str).isin(valores_normales)
+                m = df[col].astype(str).isin(valores_normales)
                 if incluir_vacios:
-                    mascara = mascara | df[col].isna()
-                df = df[mascara]
+                    m = m | df[col].isna()
+                mascara = m.to_numpy()
 
         if self.filtro_grafico:
             col_f = self.filtro_grafico["columna"]
             val_f = self.filtro_grafico["valor"]
             if col_f in df.columns:
-                df = df[df[col_f].astype(str) == str(val_f)]
+                m = (df[col_f].astype(str) == str(val_f)).to_numpy()
+                mascara = m if mascara is None else (mascara & m)
 
         if self.filtro_tipo_anomalia:
             indices_anomalos = self._indices_filtro_anomalia()
-            df = df[df.index.isin(indices_anomalos)]
+            m = np.asarray(df.index.isin(indices_anomalos))
+            mascara = m if mascara is None else (mascara & m)
 
-        return df
+        if mascara is None:
+            # Sin ningún filtro activo: una copia "superficial" (comparte los
+            # datos, cuesta casi nada) para que el resultado siga siendo un
+            # objeto distinto de self.df, igual que antes con .copy().
+            return df.copy(deep=False)
+        return df[mascara]
 
     def _recortar_por_rango_tiempo(self, df):
         """Aplica a `df` el rango del slider de la Línea de Tiempo (si hay
@@ -2683,8 +2700,41 @@ class HadarApp(QMainWindow):
         if col_t not in df.columns:
             return df
         dayfirst = resto[0] if resto else True
-        fechas = parsear_fechas(df[col_t], dayfirst=dayfirst)
-        return df[(fechas >= t0) & (fechas <= t1)]
+        fechas = self._fechas_de_columna(df, col_t, dayfirst)
+        return df[np.asarray((fechas >= t0) & (fechas <= t1))]
+
+    def _fechas_de_columna(self, df, col, dayfirst):
+        """Fechas ya interpretadas de la columna `col`, en el mismo orden
+        que las filas de `df`. Interpretar fechas es lo más caro del recorte
+        por rango: antes se rehacía completo en cada movimiento del slider.
+        Ahora se interpreta la columna de self.df UNA vez y se guarda
+        (self._cache_fechas); solo se vuelve a hacer si cambia la tabla, la
+        columna, el formato dayfirst o el tamaño de la tabla, o si se editó/
+        renombró algo a mano (esos dos casos limpian el caché a propósito).
+        Si `df` no es un subconjunto de self.df, se interpreta directo, como
+        antes, sin usar el caché."""
+        base = self.df
+        if base is not None and col in base.columns and col in df.columns:
+            cache = getattr(self, "_cache_fechas", None)
+            if (
+                cache is None or cache["df"] is not base or cache["col"] != col
+                or cache["dayfirst"] != dayfirst or cache["forma"] != base.shape
+            ):
+                resultado = parsear_fechas(base[col], dayfirst=dayfirst)
+                if hasattr(resultado, "to_numpy"):
+                    resultado = resultado.to_numpy()
+                cache = {
+                    "df": base, "col": col, "dayfirst": dayfirst, "forma": base.shape,
+                    "fechas": pd.Series(np.asarray(resultado), index=base.index),
+                }
+                self._cache_fechas = cache
+            if df is base:
+                return cache["fechas"]
+            if base.index.is_unique:
+                posiciones = base.index.get_indexer(df.index)
+                if (posiciones >= 0).all():
+                    return cache["fechas"].iloc[posiciones]
+        return parsear_fechas(df[col], dayfirst=dayfirst)
 
     def apply_table_filter(self):
         if self.df is None:
