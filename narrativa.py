@@ -723,39 +723,6 @@ class NarrativeGenerator:
             f"{detalle_html}</div>"
         )
 
-    def _diagrama_origen_html(self):
-        """El mismo diagrama de la sub-pestaña «Origen», como imagen (así también sale
-        en el PDF). Solo si tiene al menos 3 cajas (con menos no aporta nada). Si algo
-        falla (sin soporte gráfico, etc.) simplemente no se muestra: el texto de abajo
-        sigue contando lo mismo."""
-        try:
-            from .config import THEMES
-            from .origen_grafo import construir_grafo_origen
-            from .origen_ui import render_imagen_grafo
-            grafo = construir_grafo_origen(
-                self.eventos_procedencia, [str(c) for c in self.df.columns], self.indicadores
-            )
-            if len(grafo.nodos) < 3:
-                return ""
-            resultado = render_imagen_grafo(grafo, THEMES["light"])
-            if resultado is None:
-                return ""
-            imagen, ancho, _alto = resultado
-            mostrado = int(min(ancho, 520 if self.modo_impresion else 640))
-            pie = (
-                "<p class='pendiente'>Cada flecha va de lo que alimenta a lo que sale de ello. "
-                "Gris: de dónde vinieron los datos. Verde azulado: lo que se les hizo. "
-                "Morado: columnas calculadas e indicadores. «Ojo»: conviene revisar.</p>"
-            )
-            if not self.modo_impresion:
-                pie += (
-                    "<p class='pendiente'>Para ver el detalle de cada caja y a qué puede afectar, "
-                    "usa la sub-pestaña «Origen».</p>"
-                )
-            return f"<div><img src=\"{_imagen_qt_a_data_uri(imagen)}\" width=\"{mostrado}\"></div>{pie}"
-        except Exception:
-            return ""
-
     @staticmethod
     def _origen_hechos_html(hechos, eventos=()):
         """'Qué se le hizo a los datos': las correcciones de Limpieza sugerida y
@@ -809,7 +776,7 @@ class NarrativeGenerator:
             return None
 
         esc = html.escape
-        partes = [self._diagrama_origen_html(), self._origen_fuente_html(origen)]
+        partes = [self._origen_fuente_html(origen)]
         if hechos:
             partes.append(self._origen_hechos_html(hechos, self.eventos_procedencia))
 

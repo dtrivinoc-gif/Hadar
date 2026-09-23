@@ -44,8 +44,8 @@ from .indicadores import (
     Indicador, sugerir_indicadores_por_defecto, IndicadorCard, DialogoIndicador,
 )
 from .excel_transform import DialogoTransformacionExcel
-from .origen_grafo import construir_grafo_origen
-from .origen_ui import PanelOrigen
+from .linaje_grafo import construir_grafo_linaje
+from .linaje_ui import PanelLinaje
 from .procedencia import (
     BitacoraProcedencia, TIPO_COLUMNA_CALCULADA, TIPO_ARCHIVO_ORIGEN,
     ORIGEN_ARCHIVO, ORIGEN_SQL_SERVER, evento_de_origen,
@@ -1117,7 +1117,8 @@ class HadarApp(QMainWindow):
             self.panel_linea_tiempo.aplicar_tema(self.colors)
         if hasattr(self, "reporte_view"):
             self.reporte_view.setBackgroundBrush(QBrush(QColor(self.colors["bg"])))
-        self._refrescar_origen()
+        if hasattr(self, "panel_linaje"):
+            self.panel_linaje.mostrar(self.panel_linaje._grafo, self.colors)
         if self.filtered_df is not None:
             self._actualizar_metricas()
             self._update_frecuencias()
@@ -1506,10 +1507,6 @@ class HadarApp(QMainWindow):
         # El encabezado con "ƒx ⚠" es más largo que el nombre: se ensancha la columna
         # después de que la tabla termine de refrescarse (si no, se corta el texto).
         QTimer.singleShot(0, self._ensanchar_encabezados_marcados)
-        # Esta función corre tras cada cambio que importa (cargar, calcular, limpiar,
-        # editar a mano, renombrar, cambiar de tabla): el diagrama de Origen, si está a
-        # la vista, se rehace con lo nuevo.
-        self._refrescar_origen()
 
     def _ensanchar_encabezados_marcados(self):
         if self.df is None or not hasattr(self, "table_view"):
@@ -3272,19 +3269,6 @@ class HadarApp(QMainWindow):
         self._build_subtab_linaje(tab_linaje)
         self.subtabs_narrativa.addTab(tab_linaje, "Linaje")
 
-        # "Origen" (de dónde vinieron los datos, qué se les hizo, qué columnas se
-        # calcularon) NO depende de haber generado el informe: lee la bitácora de
-        # procedencia directamente, así que está disponible apenas hay datos.
-        tab_origen = QWidget()
-        layout_origen = QVBoxLayout(tab_origen)
-        layout_origen.setContentsMargins(0, 0, 0, 0)
-        self.panel_origen = PanelOrigen(self.colors)
-        layout_origen.addWidget(self.panel_origen)
-        self.subtabs_narrativa.addTab(tab_origen, "Origen")
-        self._tab_origen = tab_origen
-        self.subtabs_narrativa.currentChanged.connect(lambda _i: self._refrescar_origen())
-        self.tabview.currentChanged.connect(lambda _i: self._refrescar_origen())
-
         self._narrativa_actualizada = False
         self._ultimas_anomalias = []
         self._anomalias_por_tabla = {}
@@ -3354,71 +3338,27 @@ class HadarApp(QMainWindow):
         columna_izq.addWidget(self.lista_linaje_anomalias)
         cuerpo.addLayout(columna_izq)
 
-        self.arbol_linaje = QTreeWidget()
-        self.arbol_linaje.setHeaderLabels(["Registro conectado"])
-        self.arbol_linaje.setColumnCount(1)
-        # Clic derecho en cualquier nodo (no solo la raíz) permite re-anclar
-        # el árbol ahí -- ej. si un nodo salió truncado ("hay más, no se
-        # muestran todas"), esto deja seguir explorando esa rama en
-        # particular en vez de quedar limitado a lo que se veía desde la
-        # búsqueda original.
-        self.arbol_linaje.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.arbol_linaje.customContextMenuRequested.connect(self._menu_contextual_linaje)
-        cuerpo.addWidget(self.arbol_linaje, stretch=1)
+        # El diagrama de cajas conectadas (linaje_grafo.py / linaje_ui.py) reemplaza
+        # al árbol con sangría: misma información (registros conectados siguiendo
+        # las relaciones del esquema), al estilo Palantir. El clic derecho en una
+        # caja ("Explorar desde aquí") re-ancla la búsqueda ahí -- mismo
+        # comportamiento que antes tenía el árbol, ahora desde una caja.
+        self.panel_linaje = PanelLinaje(self.colors, al_explorar_desde=self._explorar_linaje_desde)
+        cuerpo.addWidget(self.panel_linaje, stretch=1)
 
         layout.addLayout(cuerpo, stretch=1)
 
         self._controles_linaje = [
             self.combo_linaje_tabla, self.combo_linaje_columna, self.txt_linaje_valor,
             self.btn_linaje_buscar, self.lista_linaje_anomalias, self.spin_linaje_profundidad,
+            self.panel_linaje,
         ]
 
         # Conectado al final, después de crear todos los widgets del
         # bloque: setValue(2) más arriba ya dispara valueChanged, y en ese
-        # momento self.arbol_linaje todavía no existiría si esto se
+        # momento self.panel_linaje todavía no existiría si esto se
         # conectara antes.
         self.spin_linaje_profundidad.valueChanged.connect(self._on_linaje_profundidad_change)
-
-    def _refrescar_origen(self):
-        """Vuelve a armar el diagrama de la sub-pestaña 'Origen' con lo que hay
-        ahora en la bitácora de procedencia. Es barato (un grafo de pocas cajas),
-        así que se rehace cada vez que se entra a la sub-pestaña, se genera
-        Narrativa o se cambia de tema; solo se dibuja si está a la vista."""
-        if not hasattr(self, "panel_origen") or not hasattr(self, "_tab_origen"):
-            return
-        if self.subtabs_narrativa.currentWidget() is not self._tab_origen:
-            return
-        if self.df is None:
-            self.panel_origen.mostrar(None, self.colors)
-            return
-        self.procedencia.podar(self.tablas)
-        eventos = self.procedencia.eventos_de_tabla(self.nombre_tabla_activa)
-        grafo = construir_grafo_origen(eventos, [str(c) for c in self.df.columns], self.indicadores)
-        self.panel_origen.set_anomalias(self._entradas_anomalias_para_origen())
-        self.panel_origen.mostrar(grafo, self.colors)
-
-    def _entradas_anomalias_para_origen(self):
-        """Anomalías de la última Narrativa, agrupadas por tipo + columnas (las de
-        quiebre de patrón vienen una por fila; acá se juntan), para el selector
-        'Ver desde una anomalía' del diagrama de Origen."""
-        anomalias = getattr(self, "_ultimas_anomalias", None) or []
-        grupos = {}
-        for a in anomalias:
-            columnas = [str(c) for c in (a.get("columnas") or [])]
-            if not columnas:
-                continue
-            clave = (a.get("tipo"), tuple(columnas), a.get("contexto"))
-            grupos.setdefault(clave, 0)
-            grupos[clave] += 1
-        entradas = []
-        for (tipo, columnas, contexto), n in grupos.items():
-            etiqueta = f"{ETIQUETAS_TIPO_ANOMALIA.get(tipo, tipo)} · {', '.join(columnas)}"
-            if contexto:
-                etiqueta += f" ({contexto})"
-            if n > 1:
-                etiqueta += f" · {n} casos"
-            entradas.append({"etiqueta": etiqueta, "columnas": list(columnas)})
-        return entradas
 
     def _actualizar_estado_linaje(self):
         """Habilita o deshabilita toda la sub-pestaña Linaje según si hay
@@ -3431,13 +3371,12 @@ class HadarApp(QMainWindow):
         disponible = bool(self._linaje_disponible)
         for w in self._controles_linaje:
             w.setEnabled(disponible)
-        self.arbol_linaje.setEnabled(disponible)
         if disponible:
             self.lbl_linaje_estado.setText(
                 "Elige una tabla y un ID, o doble clic en una anomalía de la izquierda."
             )
         else:
-            self.arbol_linaje.clear()
+            self.panel_linaje.mostrar(None, self.colors)
             self.lista_linaje_anomalias.clear()
             self.lbl_linaje_estado.setText(
                 "Genera Narrativa primero -- Linaje necesita las relaciones y anomalías de tu último informe."
@@ -3516,66 +3455,25 @@ class HadarApp(QMainWindow):
             filas_anomalas=self._anomalias_por_tabla,
             max_saltos=self.spin_linaje_profundidad.value(),
         )
-        self.arbol_linaje.clear()
         if raiz is None:
+            self.panel_linaje.mostrar(None, self.colors)
             self.lbl_linaje_estado.setText(f'La columna "{columna}" no existe en {tabla}.')
             return
         if raiz.indice_fila is None:
+            self.panel_linaje.mostrar(None, self.colors, mensaje_vacio=(
+                f'No se encontró {columna} = "{texto_valor}" en {tabla}.'
+            ))
             self.lbl_linaje_estado.setText(f'No se encontró {columna} = "{texto_valor}" en {tabla}.')
             return
 
         self.lbl_linaje_estado.setText(
             "Elige una tabla y un ID, o doble clic en una anomalía de la izquierda."
         )
-        item_raiz = self._construir_item_linaje(raiz)
-        self.arbol_linaje.addTopLevelItem(item_raiz)
-        self.arbol_linaje.expandAll()
-
-    def _construir_item_linaje(self, nodo):
-        """Arma recursivamente el QTreeWidgetItem de un nodo Y todos sus
-        hijos -- el árbol completo ya está en memoria (explorar_linaje ya
-        lo acotó con max_saltos/max_nodos_total), así que no hace falta
-        expansión perezosa. El punto rojo reutiliza el mismo ícono que ya
-        se usa en la pestaña Datos para anomalías: es información real
-        (esta fila tiene una anomalía detectada), no una decoración nueva."""
-        prefijo = "● " if nodo.relacion_con_padre is None else (
-            "↑ " if nodo.relacion_con_padre == "padre" else "↓ "
-        )
-        texto = f"{prefijo}{nodo.tabla} — {nodo.columna_clave} = {nodo.valor_clave}"
-        if nodo.truncado:
-            texto += "  (hay más, no se muestran todas -- clic derecho para explorar desde aquí)"
-        item = QTreeWidgetItem([texto])
-        if nodo.es_anomalia:
-            item.setIcon(0, self.table_model.icono_anomalia())
-        # Guarda tabla/columna/valor del nodo para que el menú contextual
-        # pueda re-anclar el árbol acá, sin tener que recorrer el árbol de
-        # NodoLinaje de nuevo para encontrarlo.
-        item.setData(0, Qt.ItemDataRole.UserRole, (nodo.tabla, nodo.columna_clave, nodo.valor_clave))
-        for hijo in nodo.hijos:
-            item.addChild(self._construir_item_linaje(hijo))
-        return item
-
-    def _menu_contextual_linaje(self, posicion):
-        """Clic derecho sobre un nodo del árbol de Linaje: única opción,
-        re-explorar con ese registro como nueva raíz. La raíz actual
-        también aparece en su propio menú (sin efecto real, pero no hace
-        daño y evita un caso especial para distinguirla)."""
-        item = self.arbol_linaje.itemAt(posicion)
-        if item is None:
-            return
-        datos = item.data(0, Qt.ItemDataRole.UserRole)
-        if not datos:
-            return
-        tabla, columna, valor = datos
-        menu = QMenu(self)
-        accion = menu.addAction(f'Explorar desde aquí ("{tabla}": {columna} = {valor})')
-        elegida = menu.exec(self.arbol_linaje.viewport().mapToGlobal(posicion))
-        if elegida == accion:
-            self._explorar_linaje_desde(tabla, columna, valor)
+        self.panel_linaje.mostrar(construir_grafo_linaje(raiz), self.colors)
 
     def _explorar_linaje_desde(self, tabla, columna, valor):
         """Re-ancla la búsqueda de Linaje en un registro que apareció como
-        nodo conectado (ver _menu_contextual_linaje), reutilizando los
+        nodo conectado (clic derecho en una caja de linaje_ui.py), reutilizando los
         mismos combos/campo de texto que ya usa una búsqueda manual -- así
         el usuario ve con claridad desde dónde está explorando ahora."""
         if tabla not in self.tablas:
@@ -3707,7 +3605,6 @@ class HadarApp(QMainWindow):
         self._linaje_disponible = True
         self._actualizar_estado_linaje()
         self._poblar_linaje_tras_narrativa()
-        self._refrescar_origen()
 
         # Habilita/repuebla el filtro "Anomalía" de Datos y el resumen de
         # anomalías de Frecuencias con lo recién calculado -- ambos leen
