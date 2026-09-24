@@ -3469,7 +3469,7 @@ class HadarApp(QMainWindow):
         self.lbl_linaje_estado.setText(
             "Elige una tabla y un ID, o doble clic en una anomalía de la izquierda."
         )
-        self.panel_linaje.mostrar(construir_grafo_linaje(raiz), self.colors)
+        self.panel_linaje.mostrar(construir_grafo_linaje(raiz, tablas=self.tablas), self.colors)
 
     def _explorar_linaje_desde(self, tabla, columna, valor):
         """Re-ancla la búsqueda de Linaje en un registro que apareció como
