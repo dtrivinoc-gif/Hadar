@@ -271,6 +271,7 @@ class PanelLinaje(QWidget):
         self._aristas = []
         self._seleccion = None
         self._auto_ajuste = True
+        self._detalle_visible = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -298,6 +299,12 @@ class PanelLinaje(QWidget):
         self.btn_menos.clicked.connect(lambda: self.vista.zoom(1 / 1.25))
         self.btn_mas.clicked.connect(lambda: self.vista.zoom(1.25))
         self.btn_ajustar.clicked.connect(self.ajustar)
+        self.btn_detalle = QPushButton("Ocultar detalle")
+        self.btn_detalle.setToolTip("Muestra u oculta el panel de abajo, para darle más espacio al diagrama")
+        self.btn_detalle.setCheckable(True)
+        self.btn_detalle.setFixedHeight(26)
+        self.btn_detalle.toggled.connect(self._alternar_detalle)
+        barra.addWidget(self.btn_detalle)
         layout.addLayout(barra)
 
         self.escena = QGraphicsScene()
@@ -478,6 +485,11 @@ class PanelLinaje(QWidget):
             self.vista.scale(ZOOM_MINIMO_LEGIBLE, ZOOM_MINIMO_LEGIBLE)
             self.vista.centerOn(QPointF(rect.left() + self.vista.viewport().width() / (2 * ZOOM_MINIMO_LEGIBLE),
                                         rect.top() + self.vista.viewport().height() / (2 * ZOOM_MINIMO_LEGIBLE)))
+
+    def _alternar_detalle(self, oculto):
+        self._detalle_visible = not oculto
+        self.detalle.setVisible(self._detalle_visible)
+        self.btn_detalle.setText("Mostrar detalle" if oculto else "Ocultar detalle")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

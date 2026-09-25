@@ -3251,7 +3251,21 @@ class HadarApp(QMainWindow):
         # del mismo botón "Generar Narrativa" deja esa dependencia clara,
         # en vez de una pestaña suelta que se ve rota si se abre primero.
         self.subtabs_narrativa = QTabWidget()
+        # Ocultas hasta generar Narrativa por primera vez: Linaje no tiene sentido
+        # antes (necesita las relaciones y anomalías de un informe), y dejar el
+        # espacio libre mientras tanto evita dos sub-pestañas que se ven rotas o
+        # vacías apenas se abre esta pestaña. Una vez generada la primera vez,
+        # quedan visibles aunque el informe se marque desactualizado después
+        # (el contenido anterior sigue siendo útil; ver _marcar_narrativa_desactualizada).
+        self.subtabs_narrativa.setVisible(False)
         layout.addWidget(self.subtabs_narrativa, stretch=1)
+
+        self.lbl_narrativa_vacia = QLabel(
+            "Presiona \"Generar Narrativa\" para ver aquí el Informe y el Linaje."
+        )
+        self.lbl_narrativa_vacia.setObjectName("muted")
+        self.lbl_narrativa_vacia.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_narrativa_vacia, stretch=1)
 
         tab_informe = QWidget()
         layout_informe = QVBoxLayout(tab_informe)
@@ -3270,6 +3284,7 @@ class HadarApp(QMainWindow):
         self.subtabs_narrativa.addTab(tab_linaje, "Linaje")
 
         self._narrativa_actualizada = False
+        self._narrativa_generada_alguna_vez = False
         self._ultimas_anomalias = []
         self._anomalias_por_tabla = {}
         self._linaje_disponible = False
@@ -3602,6 +3617,10 @@ class HadarApp(QMainWindow):
         self._ultimo_df_narrativa = df
         self._ultimo_nombre_dataset_narrativa = nombre_dataset
         self._narrativa_actualizada = True
+        if not self._narrativa_generada_alguna_vez:
+            self._narrativa_generada_alguna_vez = True
+            self.lbl_narrativa_vacia.setVisible(False)
+            self.subtabs_narrativa.setVisible(True)
         self._linaje_disponible = True
         self._actualizar_estado_linaje()
         self._poblar_linaje_tras_narrativa()
